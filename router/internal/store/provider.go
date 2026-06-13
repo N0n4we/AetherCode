@@ -374,13 +374,13 @@ type Cache struct {
 	version      int64
 	lastSyncedAt time.Time
 	byID         map[uint]Provider
-	byModel      map[string]map[string][]uint
+	byModel      map[string][]uint
 }
 
 func NewCache() *Cache {
 	return &Cache{
 		byID:    make(map[uint]Provider),
-		byModel: make(map[string]map[string][]uint),
+		byModel: make(map[string][]uint),
 	}
 }
 
@@ -434,7 +434,7 @@ func SyncCache(ctx context.Context, db *Store, cache *Cache, interval time.Durat
 
 func (c *Cache) Replace(providers []Provider, version int64) {
 	byID := make(map[uint]Provider, len(providers))
-	byModel := make(map[string]map[string][]uint)
+	byModel := make(map[string][]uint)
 
 	for _, provider := range providers {
 		provider.applyDefaults()
@@ -442,28 +442,21 @@ func (c *Cache) Replace(providers []Provider, version int64) {
 		if provider.Status != StatusEnabled {
 			continue
 		}
-		for _, group := range provider.GroupList() {
-			if byModel[group] == nil {
-				byModel[group] = make(map[string][]uint)
-			}
-			for _, model := range provider.ModelList() {
-				byModel[group][model] = append(byModel[group][model], provider.ID)
-			}
+		for _, model := range provider.ModelList() {
+			byModel[model] = append(byModel[model], provider.ID)
 		}
 	}
 
-	for group := range byModel {
-		for model := range byModel[group] {
-			ids := byModel[group][model]
-			sort.SliceStable(ids, func(i, j int) bool {
-				left := byID[ids[i]]
-				right := byID[ids[j]]
-				if left.Priority == right.Priority {
-					return left.ID < right.ID
-				}
-				return left.Priority > right.Priority
-			})
-		}
+	for model := range byModel {
+		ids := byModel[model]
+		sort.SliceStable(ids, func(i, j int) bool {
+			left := byID[ids[i]]
+			right := byID[ids[j]]
+			if left.Priority == right.Priority {
+				return left.ID < right.ID
+			}
+			return left.Priority > right.Priority
+		})
 	}
 
 	c.mu.Lock()
@@ -485,30 +478,22 @@ func (c *Cache) Stats() CacheStats {
 	defer c.mu.RUnlock()
 
 	enabled := 0
-	modelCount := 0
 	for _, provider := range c.byID {
 		if provider.Status == StatusEnabled {
 			enabled++
 		}
-	}
-	for _, models := range c.byModel {
-		modelCount += len(models)
 	}
 	return CacheStats{
 		Version:              c.version,
 		LastSyncedAt:         c.lastSyncedAt,
 		ProviderCount:        len(c.byID),
 		EnabledProviderCount: enabled,
-		GroupCount:           len(c.byModel),
-		ModelCount:           modelCount,
+		GroupCount:           0,
+		ModelCount:           len(c.byModel),
 	}
 }
 
-func (c *Cache) Select(group string, model string, excluded map[uint]bool) (*Provider, error) {
-	group = strings.TrimSpace(group)
-	if group == "" {
-		group = DefaultGroup
-	}
+func (c *Cache) Select(model string, excluded map[uint]bool) (*Provider, error) {
 	model = strings.TrimSpace(model)
 	if model == "" {
 		return nil, errors.New("model is required")
@@ -517,12 +502,9 @@ func (c *Cache) Select(group string, model string, excluded map[uint]bool) (*Pro
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	ids := c.idsForLocked(group, model)
-	if len(ids) == 0 && group != DefaultGroup {
-		ids = c.idsForLocked(DefaultGroup, model)
-	}
+	ids := c.idsForLocked(model)
 	if len(ids) == 0 {
-		return nil, fmt.Errorf("no provider for group %q and model %q", group, model)
+		return nil, fmt.Errorf("no provider for model %q", model)
 	}
 
 	candidates := make([]Provider, 0, len(ids))
@@ -536,7 +518,7 @@ func (c *Cache) Select(group string, model string, excluded map[uint]bool) (*Pro
 		}
 	}
 	if len(candidates) == 0 {
-		return nil, fmt.Errorf("no remaining provider for group %q and model %q", group, model)
+		return nil, fmt.Errorf("no remaining provider for model %q", model)
 	}
 
 	topPriority := candidates[0].Priority
@@ -551,15 +533,11 @@ func (c *Cache) Select(group string, model string, excluded map[uint]bool) (*Pro
 	return &selected, nil
 }
 
-func (c *Cache) idsForLocked(group string, model string) []uint {
-	models := c.byModel[group]
-	if len(models) == 0 {
-		return nil
-	}
-	if ids := models[model]; len(ids) > 0 {
+func (c *Cache) idsForLocked(model string) []uint {
+	if ids := c.byModel[model]; len(ids) > 0 {
 		return ids
 	}
-	return models["*"]
+	return c.byModel["*"]
 }
 
 func pickWeighted(providers []Provider) Provider {
