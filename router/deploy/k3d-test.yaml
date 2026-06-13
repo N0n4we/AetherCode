@@ -1,0 +1,185 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aether-router-test
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: router-secrets
+  namespace: aether-router-test
+type: Opaque
+stringData:
+  router-api-key: public-key
+  router-admin-key: admin-key
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: aether-router-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_DB
+              value: router
+            - name: POSTGRES_USER
+              value: router
+            - name: POSTGRES_PASSWORD
+              value: router
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "router", "-d", "router"]
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: aether-router-test
+spec:
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-provider
+  namespace: aether-router-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-provider
+  template:
+    metadata:
+      labels:
+        app: mock-provider
+    spec:
+      containers:
+        - name: mock-provider
+          image: aethercode-router:k3d-test
+          imagePullPolicy: IfNotPresent
+          command: ["/mock-provider"]
+          env:
+            - name: MOCK_PROVIDER_ADDR
+              value: ":8081"
+          ports:
+            - containerPort: 8081
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 2
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-provider
+  namespace: aether-router-test
+spec:
+  selector:
+    app: mock-provider
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8081
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: router
+  namespace: aether-router-test
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: router
+  template:
+    metadata:
+      labels:
+        app: router
+    spec:
+      containers:
+        - name: router
+          image: aethercode-router:k3d-test
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ROUTER_ADDR
+              value: ":8080"
+            - name: ROUTER_INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: SQL_DSN
+              value: "postgres://router:router@postgres:5432/router?sslmode=disable"
+            - name: CONFIG_SYNC_INTERVAL
+              value: "1s"
+            - name: UPSTREAM_TIMEOUT
+              value: "30s"
+            - name: UPSTREAM_MAX_RETRIES
+              value: "1"
+            - name: ROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: router-secrets
+                  key: router-api-key
+            - name: ROUTER_ADMIN_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: router-secrets
+                  key: router-admin-key
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: router
+  namespace: aether-router-test
+spec:
+  type: LoadBalancer
+  selector:
+    app: router
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

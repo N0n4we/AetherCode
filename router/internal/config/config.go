@@ -8,6 +8,7 @@ import (
 
 type Config struct {
 	Addr               string
+	InstanceID         string
 	SQLDSN             string
 	ConfigSyncInterval time.Duration
 	RequestTimeout     time.Duration
@@ -20,14 +21,23 @@ type Config struct {
 func Load() Config {
 	return Config{
 		Addr:               getenv("ROUTER_ADDR", ":8080"),
+		InstanceID:         getenv("ROUTER_INSTANCE_ID", hostname()),
 		SQLDSN:             os.Getenv("SQL_DSN"),
-		ConfigSyncInterval: getDuration("CONFIG_SYNC_INTERVAL", 30*time.Second),
+		ConfigSyncInterval: getDuration("CONFIG_SYNC_INTERVAL", 5*time.Second),
 		RequestTimeout:     getDuration("UPSTREAM_TIMEOUT", 5*time.Minute),
 		MaxRetries:         getInt("UPSTREAM_MAX_RETRIES", 2),
 		MaxBodyBytes:       int64(getInt("MAX_BODY_BYTES", 32<<20)),
 		APIKey:             os.Getenv("ROUTER_API_KEY"),
 		AdminKey:           os.Getenv("ROUTER_ADMIN_KEY"),
 	}
+}
+
+func hostname() string {
+	name, err := os.Hostname()
+	if err != nil || name == "" {
+		return "local"
+	}
+	return name
 }
 
 func getenv(key string, fallback string) string {

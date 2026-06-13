@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"aethercode-router/internal/store"
@@ -52,6 +53,10 @@ func (s *Server) openAIRoute(kind upstream.Kind) http.HandlerFunc {
 				return
 			}
 			excluded[provider.ID] = true
+			w.Header().Set("X-Aether-Router-Instance", s.cfg.InstanceID)
+			w.Header().Set("X-Aether-Provider-ID", strconv.FormatUint(uint64(provider.ID), 10))
+			w.Header().Set("X-Aether-Provider-Name", provider.Name)
+			w.Header().Set("X-Aether-Provider-Version", strconv.FormatInt(s.cache.Version(), 10))
 
 			upstreamBody, err := encodeUpstreamRequest(request, provider, model)
 			if err != nil {

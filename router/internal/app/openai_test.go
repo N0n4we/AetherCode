@@ -48,9 +48,10 @@ func TestChatCompletionsProxyUsesSelectedProvider(t *testing.T) {
 		Groups:       "default",
 		ModelMapping: store.StringMap{"public-model": "upstream-model"},
 		Status:       store.StatusEnabled,
-	}})
+	}}, 11)
 
 	server := New(config.Config{
+		InstanceID:     "test-router",
 		RequestTimeout: 5 * time.Second,
 		MaxRetries:     0,
 		MaxBodyBytes:   1 << 20,
@@ -70,5 +71,11 @@ func TestChatCompletionsProxyUsesSelectedProvider(t *testing.T) {
 	}
 	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
 		t.Fatalf("unexpected content type %q", ct)
+	}
+	if got := rec.Header().Get("X-Aether-Router-Instance"); got != "test-router" {
+		t.Fatalf("unexpected router instance header %q", got)
+	}
+	if got := rec.Header().Get("X-Aether-Provider-Version"); got != "11" {
+		t.Fatalf("unexpected provider version header %q", got)
 	}
 }

@@ -26,10 +26,12 @@ func main() {
 	}
 
 	cache := store.NewCache()
-	if err := store.ReloadCache(context.Background(), db, cache); err != nil {
+	version, err := store.ReloadCache(context.Background(), db, cache)
+	if err != nil {
 		logger.Error("load provider cache", "error", err)
 		os.Exit(1)
 	}
+	logger.Info("provider cache loaded", "version", version)
 
 	srv := app.New(cfg, db, cache, logger)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
