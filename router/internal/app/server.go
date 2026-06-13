@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -34,8 +35,10 @@ func New(cfg config.Config, db *store.Store, cache *store.Cache, logger *slog.Lo
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.health)
+	mux.HandleFunc("/readyz", s.ready)
 	mux.HandleFunc("/v1/chat/completions", s.openAIRoute(upstream.ChatCompletions))
 	mux.HandleFunc("/v1/completions", s.openAIRoute(upstream.Completions))
+	mux.HandleFunc("/internal/status", s.adminStatus)
 	mux.HandleFunc("/internal/providers", s.adminProviders)
 	mux.HandleFunc("/internal/providers/", s.adminProviderByID)
 	return mux
@@ -44,6 +47,28 @@ func (s *Server) Routes() http.Handler {
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
+}
+
+func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
+	dbVersion, err := s.store.ProviderVersion(r.Context())
+	stats := s.cache.Stats()
+	if err != nil || stats.Version == 0 || stats.Version < dbVersion {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":       "not_ready",
+			"cache":        stats,
+			"db_version":   dbVersion,
+			"cache_loaded": stats.Version > 0,
+		})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":     "ready",
+		"cache":      stats,
+		"db_version": dbVersion,
+	})
 }
 
 func bearerToken(header string) string {

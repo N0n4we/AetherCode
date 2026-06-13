@@ -13,16 +13,18 @@ import (
 	"sync"
 	"time"
 
+	"github.com/glebarez/sqlite"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const (
-	StatusEnabled  = 1
-	StatusDisabled = 2
-	DefaultGroup   = "default"
+	StatusEnabled             = 1
+	StatusDisabled            = 2
+	DefaultGroup              = "default"
+	ProviderConfigVersionName = "providers"
 )
 
 type StringMap map[string]string
@@ -76,6 +78,16 @@ type Provider struct {
 	Priority     int64     `json:"priority" gorm:"default:0;index"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+type ConfigVersion struct {
+	Name      string    `json:"name" gorm:"primaryKey;size:64"`
+	Version   int64     `json:"version" gorm:"not null;default:1"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (ConfigVersion) TableName() string {
+	return "router_config_versions"
 }
 
 func (Provider) TableName() string {
@@ -243,10 +255,14 @@ func Open(dsn string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := db.AutoMigrate(&Provider{}); err != nil {
+	if err := db.AutoMigrate(&Provider{}, &ConfigVersion{}); err != nil {
 		return nil, err
 	}
-	return &Store{db: db}, nil
+	store := &Store{db: db}
+	if err := store.ensureProviderVersion(context.Background()); err != nil {
+		return nil, err
+	}
+	return store, nil
 }
 
 func openGorm(dsn string) (*gorm.DB, error) {
@@ -276,7 +292,12 @@ func (s *Store) Providers(ctx context.Context) ([]Provider, error) {
 }
 
 func (s *Store) CreateProvider(ctx context.Context, provider *Provider) error {
-	return s.db.WithContext(ctx).Create(provider).Error
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(provider).Error; err != nil {
+			return err
+		}
+		return bumpProviderVersion(tx)
+	})
 }
 
 func (s *Store) Provider(ctx context.Context, id uint) (*Provider, error) {
@@ -288,17 +309,72 @@ func (s *Store) Provider(ctx context.Context, id uint) (*Provider, error) {
 }
 
 func (s *Store) SaveProvider(ctx context.Context, provider *Provider) error {
-	return s.db.WithContext(ctx).Save(provider).Error
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(provider).Error; err != nil {
+			return err
+		}
+		return bumpProviderVersion(tx)
+	})
 }
 
 func (s *Store) DeleteProvider(ctx context.Context, id uint) error {
-	return s.db.WithContext(ctx).Delete(&Provider{}, "id = ?", id).Error
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Delete(&Provider{}, "id = ?", id).Error; err != nil {
+			return err
+		}
+		return bumpProviderVersion(tx)
+	})
+}
+
+func (s *Store) ProviderVersion(ctx context.Context) (int64, error) {
+	var version ConfigVersion
+	if err := s.db.WithContext(ctx).First(&version, "name = ?", ProviderConfigVersionName).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			if ensureErr := s.ensureProviderVersion(ctx); ensureErr != nil {
+				return 0, ensureErr
+			}
+			return 1, nil
+		}
+		return 0, err
+	}
+	return version.Version, nil
+}
+
+func (s *Store) ensureProviderVersion(ctx context.Context) error {
+	return s.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&ConfigVersion{
+		Name:    ProviderConfigVersionName,
+		Version: 1,
+	}).Error
+}
+
+func bumpProviderVersion(tx *gorm.DB) error {
+	now := time.Now()
+	var version ConfigVersion
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&version, "name = ?", ProviderConfigVersionName).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return tx.Create(&ConfigVersion{
+			Name:      ProviderConfigVersionName,
+			Version:   1,
+			UpdatedAt: now,
+		}).Error
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Model(&ConfigVersion{}).
+		Where("name = ?", ProviderConfigVersionName).
+		Updates(map[string]interface{}{
+			"version":    gorm.Expr("version + ?", 1),
+			"updated_at": now,
+		}).Error
 }
 
 type Cache struct {
-	mu      sync.RWMutex
-	byID    map[uint]Provider
-	byModel map[string]map[string][]uint
+	mu           sync.RWMutex
+	version      int64
+	lastSyncedAt time.Time
+	byID         map[uint]Provider
+	byModel      map[string]map[string][]uint
 }
 
 func NewCache() *Cache {
@@ -308,13 +384,26 @@ func NewCache() *Cache {
 	}
 }
 
-func ReloadCache(ctx context.Context, db *Store, cache *Cache) error {
+type CacheStats struct {
+	Version              int64     `json:"version"`
+	LastSyncedAt         time.Time `json:"last_synced_at"`
+	ProviderCount        int       `json:"provider_count"`
+	EnabledProviderCount int       `json:"enabled_provider_count"`
+	GroupCount           int       `json:"group_count"`
+	ModelCount           int       `json:"model_count"`
+}
+
+func ReloadCache(ctx context.Context, db *Store, cache *Cache) (int64, error) {
+	version, err := db.ProviderVersion(ctx)
+	if err != nil {
+		return 0, err
+	}
 	providers, err := db.Providers(ctx)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	cache.Replace(providers)
-	return nil
+	cache.Replace(providers, version)
+	return version, nil
 }
 
 func SyncCache(ctx context.Context, db *Store, cache *Cache, interval time.Duration, logger *slog.Logger) {
@@ -325,16 +414,25 @@ func SyncCache(ctx context.Context, db *Store, cache *Cache, interval time.Durat
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := ReloadCache(ctx, db, cache); err != nil {
-				logger.Error("sync providers from database", "error", err)
+			dbVersion, err := db.ProviderVersion(ctx)
+			if err != nil {
+				logger.Error("read provider config version", "error", err)
 				continue
 			}
-			logger.Info("providers synced from database")
+			if cache.Version() == dbVersion {
+				continue
+			}
+			loadedVersion, err := ReloadCache(ctx, db, cache)
+			if err != nil {
+				logger.Error("sync providers from database", "error", err, "db_version", dbVersion)
+				continue
+			}
+			logger.Info("providers synced from database", "version", loadedVersion)
 		}
 	}
 }
 
-func (c *Cache) Replace(providers []Provider) {
+func (c *Cache) Replace(providers []Provider, version int64) {
 	byID := make(map[uint]Provider, len(providers))
 	byModel := make(map[string]map[string][]uint)
 
@@ -369,9 +467,41 @@ func (c *Cache) Replace(providers []Provider) {
 	}
 
 	c.mu.Lock()
+	c.version = version
+	c.lastSyncedAt = time.Now()
 	c.byID = byID
 	c.byModel = byModel
 	c.mu.Unlock()
+}
+
+func (c *Cache) Version() int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.version
+}
+
+func (c *Cache) Stats() CacheStats {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	enabled := 0
+	modelCount := 0
+	for _, provider := range c.byID {
+		if provider.Status == StatusEnabled {
+			enabled++
+		}
+	}
+	for _, models := range c.byModel {
+		modelCount += len(models)
+	}
+	return CacheStats{
+		Version:              c.version,
+		LastSyncedAt:         c.lastSyncedAt,
+		ProviderCount:        len(c.byID),
+		EnabledProviderCount: enabled,
+		GroupCount:           len(c.byModel),
+		ModelCount:           modelCount,
+	}
 }
 
 func (c *Cache) Select(group string, model string, excluded map[uint]bool) (*Provider, error) {

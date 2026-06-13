@@ -39,7 +39,9 @@ func (s *Server) adminProviders(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		_ = store.ReloadCache(r.Context(), s.store, s.cache)
+		if !s.reloadLocalCache(w, r) {
+			return
+		}
 		writeJSON(w, http.StatusCreated, provider.Public())
 	default:
 		w.Header().Set("Allow", "GET, POST")
@@ -58,11 +60,11 @@ func (s *Server) adminProviderByID(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if err := store.ReloadCache(r.Context(), s.store, s.cache); err != nil {
+		if _, err := store.ReloadCache(r.Context(), s.store, s.cache); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "synced"})
+		writeJSON(w, http.StatusOK, map[string]interface{}{"status": "synced", "cache": s.cache.Stats()})
 		return
 	}
 
@@ -96,19 +98,56 @@ func (s *Server) adminProviderByID(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		_ = store.ReloadCache(r.Context(), s.store, s.cache)
+		if !s.reloadLocalCache(w, r) {
+			return
+		}
 		writeJSON(w, http.StatusOK, provider.Public())
 	case http.MethodDelete:
 		if err := s.store.DeleteProvider(r.Context(), id); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		_ = store.ReloadCache(r.Context(), s.store, s.cache)
+		if !s.reloadLocalCache(w, r) {
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		w.Header().Set("Allow", "GET, PUT, DELETE")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *Server) adminStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.checkAdminAuth(w, r) {
+		return
+	}
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	dbVersion, err := s.store.ProviderVersion(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	stats := s.cache.Stats()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"instance_id": s.cfg.InstanceID,
+		"database": map[string]interface{}{
+			"provider_version": dbVersion,
+		},
+		"cache":   stats,
+		"in_sync": stats.Version == dbVersion,
+	})
+}
+
+func (s *Server) reloadLocalCache(w http.ResponseWriter, r *http.Request) bool {
+	if _, err := store.ReloadCache(r.Context(), s.store, s.cache); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return false
+	}
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, status int, value interface{}) {
