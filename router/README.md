@@ -25,8 +25,20 @@ Useful environment variables:
 Providers are stored in `router_providers`. Provider config changes bump the
 shared `router_config_versions.providers` version in the same DB transaction.
 Every container polls the version and reloads only when it changes, then rebuilds
-an in-memory `group -> model -> providers` index. This follows the `new-api`
+an in-memory `modelId -> providers` index. This follows the `new-api`
 shared-DB cache-sync model without requiring pod-to-pod communication.
+
+Routing is based on the public model IDs listed in each provider's `models`
+field. Multiple enabled providers may list the same model ID; the router chooses
+among them by highest `priority`, then by `weight` when multiple candidates have
+that priority. Providers listing `*` act as wildcard fallback providers when no
+exact model ID is configured.
+
+The `groups` field is still accepted and returned by the admin API for backward
+compatibility, but it is legacy/internal metadata. Public OpenAI-compatible
+requests cannot steer routing with a body `group` field or with
+`X-Aether-Group` / `X-Router-Group` headers. Body `group` is stripped before the
+request is sent upstream.
 
 Minimal admin create request:
 

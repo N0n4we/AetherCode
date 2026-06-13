@@ -41,13 +41,12 @@ func (s *Server) openAIRoute(kind upstream.Kind) http.HandlerFunc {
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "model_required", err.Error())
 			return
 		}
-		group := groupFromRequest(r, request)
 		delete(request, "group")
 
 		excluded := map[uint]bool{}
 		var lastErr error
 		for attempt := 0; attempt <= s.cfg.MaxRetries; attempt++ {
-			provider, err := s.cache.Select(group, model, excluded)
+			provider, err := s.cache.Select(model, excluded)
 			if err != nil {
 				writeOpenAIError(w, http.StatusServiceUnavailable, "invalid_request_error", "model_not_found", err.Error())
 				return
@@ -100,23 +99,6 @@ func modelFromRequest(request map[string]json.RawMessage) (string, error) {
 		return "", fmt.Errorf("field model must be a non-empty string")
 	}
 	return strings.TrimSpace(model), nil
-}
-
-func groupFromRequest(r *http.Request, request map[string]json.RawMessage) string {
-	for _, header := range []string{"X-Aether-Group", "X-Router-Group"} {
-		if group := strings.TrimSpace(r.Header.Get(header)); group != "" {
-			return group
-		}
-	}
-	raw, ok := request["group"]
-	if !ok {
-		return store.DefaultGroup
-	}
-	var group string
-	if err := json.Unmarshal(raw, &group); err != nil || strings.TrimSpace(group) == "" {
-		return store.DefaultGroup
-	}
-	return strings.TrimSpace(group)
 }
 
 func encodeUpstreamRequest(request map[string]json.RawMessage, provider *store.Provider, model string) ([]byte, error) {
