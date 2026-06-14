@@ -36,11 +36,10 @@ func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.health)
 	mux.HandleFunc("/readyz", s.ready)
-	mux.HandleFunc("/v1/chat/completions", s.openAIRoute(upstream.ChatCompletions))
-	mux.HandleFunc("/v1/completions", s.openAIRoute(upstream.Completions))
 	mux.HandleFunc("/internal/status", s.adminStatus)
 	mux.HandleFunc("/internal/providers", s.adminProviders)
 	mux.HandleFunc("/internal/providers/", s.adminProviderByID)
+	mux.HandleFunc("/", s.relayRouteHandler())
 	return mux
 }
 

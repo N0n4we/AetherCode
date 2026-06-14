@@ -29,10 +29,32 @@ an in-memory `modelId -> providers` index. This follows the `new-api`
 shared-DB cache-sync model without requiring pod-to-pod communication.
 
 Routing is based on the public model IDs listed in each provider's `models`
-field. Multiple enabled providers may list the same model ID; the router chooses
-among them by highest `priority`, then by `weight` when multiple candidates have
+field plus optional endpoint capabilities. Multiple enabled providers may list
+the same model ID; the router chooses among those matching the requested
+capability by highest `priority`, then by `weight` when multiple candidates have
 that priority. Providers listing `*` act as wildcard fallback providers when no
 exact model ID is configured.
+
+`endpoint_capabilities` is optional. Providers without explicit capabilities
+default to the current OpenAI-compatible completion routes:
+`openai.chat_completions` and `openai.completions`. Supported capability
+identifiers are:
+
+- `openai.chat_completions`
+- `openai.completions`
+- `openai.embeddings`
+- `openai.images`
+- `openai.audio`
+- `openai.responses`
+- `openai.rerank`
+- `claude.messages`
+- `gemini.generate`
+- `realtime`
+- `task.video`
+
+`channel_type` and `relay_format` are optional metadata fields reserved for
+future adaptor routing. `/internal/status` includes aggregate
+`cache.capability_counts` for enabled providers.
 
 The `groups` field is still accepted and returned by the admin API for backward
 compatibility, but it is legacy/internal metadata. Public OpenAI-compatible
@@ -52,6 +74,12 @@ curl -X POST http://localhost:8080/internal/providers \
     "base_url": "https://api.openai.com/v1",
     "api_key": "sk-...",
     "models": "gpt-4o-mini,gpt-4o",
+    "endpoint_capabilities": [
+      "openai.chat_completions",
+      "openai.completions"
+    ],
+    "channel_type": "openai",
+    "relay_format": "openai-compatible",
     "groups": "default",
     "status": 1,
     "priority": 10,
@@ -59,20 +87,88 @@ curl -X POST http://localhost:8080/internal/providers \
   }'
 ```
 
-Supported routes:
+Operational routes:
 
-- `POST /v1/chat/completions`
-- `POST /v1/completions`
 - `GET /healthz`
 - `GET /readyz`
 - `GET /internal/status`
 
-Successful `/v1/*` responses include:
+## Route Compatibility Matrix
+
+Relay route registration is descriptor-driven. Registered routes include method,
+path pattern, route family, endpoint capability, response format, and
+implementation status. Unknown paths are left as normal not-found responses;
+registered but unimplemented routes return HTTP `501` with error code
+`unsupported_endpoint`.
+
+Implemented relay routes:
+
+| Method | Path | Family | Capability | Format |
+| --- | --- | --- | --- | --- |
+| POST | `/v1/chat/completions` | OpenAI | `openai.chat_completions` | OpenAI |
+| POST | `/v1/completions` | OpenAI | `openai.completions` | OpenAI |
+
+Metadata routes:
+
+| Method | Path | Family | Source | Format |
+| --- | --- | --- | --- | --- |
+| GET | `/v1/models` | OpenAI | provider cache modelIds | OpenAI list |
+| GET | `/v1/models/{model}` | OpenAI | provider cache modelIds | OpenAI model |
+| GET | `/v1beta/models` | Gemini | provider cache modelIds | Gemini list |
+| GET | `/v1beta/openai/models` | OpenAI | provider cache modelIds | OpenAI list |
+
+Unsupported shell routes:
+
+| Method | Path | Family | Capability |
+| --- | --- | --- | --- |
+| POST | `/v1/responses` | OpenAI | `openai.responses` |
+| POST | `/v1/responses/compact` | OpenAI | `openai.responses` |
+| POST | `/v1/embeddings` | OpenAI | `openai.embeddings` |
+| POST | `/v1/images/generations` | OpenAI | `openai.images` |
+| POST | `/v1/images/edits` | OpenAI | `openai.images` |
+| POST | `/v1/audio/transcriptions` | OpenAI | `openai.audio` |
+| POST | `/v1/audio/translations` | OpenAI | `openai.audio` |
+| POST | `/v1/audio/speech` | OpenAI | `openai.audio` |
+| POST | `/v1/rerank` | OpenAI | `openai.rerank` |
+| POST | `/v1/messages` | Claude | `claude.messages` |
+| POST | `/v1beta/models/{model}:generateContent` | Gemini | `gemini.generate` |
+| POST | `/v1beta/models/{model}:streamGenerateContent` | Gemini | `gemini.generate` |
+| GET | `/v1/realtime` | Realtime | `realtime` |
+| POST | `/v1/tasks/video` | Task | `task.video` |
+| GET | `/v1/tasks/{task_id}` | Task | `task.video` |
+| POST | `/v1/videos/generations` | Task | `task.video` |
+| GET | `/v1/videos/{task_id}` | Task | `task.video` |
+
+Successful proxied completion responses include:
 
 - `X-Aether-Router-Instance`
-- `X-Aether-Provider-Id`
+- `X-Aether-Provider-ID`
 - `X-Aether-Provider-Name`
 - `X-Aether-Provider-Version`
+
+## OpenAI-Compatible Relay
+
+`POST /v1/chat/completions` and `POST /v1/completions` use the same internal
+relay pipeline. The pipeline validates method, public API key, maximum body
+size, JSON syntax, and a non-empty string `model` before selecting a provider.
+The request body is replayable across attempts: client-only routing hints such
+as `group` are stripped, the selected provider's model mapping rewrites
+`model`, and all other JSON fields pass through unchanged.
+
+Provider selection filters by endpoint capability before dispatch:
+`/v1/chat/completions` requires `openai.chat_completions`, and
+`/v1/completions` requires `openai.completions`. Dispatch uses the configured
+upstream auth header/prefix, API key, and extra provider headers. Hop-by-hop
+response headers are filtered, while normal upstream response headers and the
+`X-Aether-*` provider metadata are returned to the client.
+
+Retries happen only before anything has been committed to the client. Network
+errors, `429`, and `5xx` responses are retried up to `UPSTREAM_MAX_RETRIES`,
+excluding providers already attempted for that request. If all eligible
+providers fail with retryable errors, the router returns a `502`
+OpenAI-compatible `upstream_error`. Non-retryable upstream `4xx` responses are
+returned as-is. Once response headers or body bytes have been written, including
+during streaming responses, the router does not retry another provider.
 
 ## k3d Test
 

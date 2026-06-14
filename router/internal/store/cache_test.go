@@ -109,6 +109,137 @@ func TestCacheSelectStatusPriorityWeightAndRetryExclusion(t *testing.T) {
 	}
 }
 
+func TestProviderEndpointCapabilitiesDefaultAndNormalize(t *testing.T) {
+	provider := Provider{
+		Provider:             "openai",
+		Models:               "gpt-4o",
+		EndpointCapabilities: StringList{" OpenAI.Chat_Completions ", "openai.chat_completions", "openai.embeddings", ""},
+	}
+	provider.applyDefaults()
+
+	want := StringList{EndpointCapabilityOpenAIChatCompletions, EndpointCapabilityOpenAIEmbeddings}
+	if len(provider.EndpointCapabilities) != len(want) {
+		t.Fatalf("expected %d capabilities, got %#v", len(want), provider.EndpointCapabilities)
+	}
+	for i := range want {
+		if provider.EndpointCapabilities[i] != want[i] {
+			t.Fatalf("expected capability %d to be %q, got %q", i, want[i], provider.EndpointCapabilities[i])
+		}
+	}
+	if !provider.SupportsCapability(EndpointCapabilityOpenAIChatCompletions) {
+		t.Fatalf("expected provider to support chat completions")
+	}
+	if provider.SupportsCapability(EndpointCapabilityOpenAICompletions) {
+		t.Fatalf("explicit capabilities should not inherit default completions")
+	}
+
+	legacy := Provider{Provider: "openai", Models: "gpt-4o"}
+	legacy.applyDefaults()
+	if !legacy.SupportsCapability(EndpointCapabilityOpenAIChatCompletions) || !legacy.SupportsCapability(EndpointCapabilityOpenAICompletions) {
+		t.Fatalf("legacy provider did not receive default completion capabilities: %#v", legacy.EndpointCapabilities)
+	}
+	if public := (Provider{}).Public(); len(public.EndpointCapabilities) != 2 {
+		t.Fatalf("public legacy provider should expose default capabilities, got %#v", public.EndpointCapabilities)
+	}
+}
+
+func TestCacheSelectForCapabilityFiltersProviders(t *testing.T) {
+	cache := NewCache()
+	cache.Replace([]Provider{
+		{
+			ID:                   1,
+			Provider:             "openai",
+			Models:               "gpt-4o",
+			Status:               StatusEnabled,
+			Priority:             10,
+			EndpointCapabilities: StringList{EndpointCapabilityOpenAIEmbeddings},
+		},
+		{
+			ID:                   2,
+			Provider:             "openai",
+			Models:               "gpt-4o",
+			Status:               StatusEnabled,
+			Priority:             1,
+			EndpointCapabilities: StringList{EndpointCapabilityOpenAIChatCompletions},
+		},
+		{
+			ID:                   3,
+			Provider:             "openai",
+			Models:               "*",
+			Status:               StatusEnabled,
+			Priority:             100,
+			EndpointCapabilities: StringList{EndpointCapabilityOpenAICompletions},
+		},
+	}, 8)
+
+	selected, err := cache.SelectForCapability("gpt-4o", EndpointCapabilityOpenAIChatCompletions, nil)
+	if err != nil {
+		t.Fatalf("select chat capability: %v", err)
+	}
+	if selected.ID != 2 {
+		t.Fatalf("expected provider 2 for chat capability, got %d", selected.ID)
+	}
+
+	selected, err = cache.SelectForCapability("gpt-4o", EndpointCapabilityOpenAIEmbeddings, nil)
+	if err != nil {
+		t.Fatalf("select embeddings capability: %v", err)
+	}
+	if selected.ID != 1 {
+		t.Fatalf("expected provider 1 for embeddings capability, got %d", selected.ID)
+	}
+
+	selected, err = cache.SelectForCapability("unlisted", EndpointCapabilityOpenAICompletions, nil)
+	if err != nil {
+		t.Fatalf("select wildcard completion capability: %v", err)
+	}
+	if selected.ID != 3 {
+		t.Fatalf("expected wildcard provider 3, got %d", selected.ID)
+	}
+
+	_, err = cache.SelectForCapability("gpt-4o", EndpointCapabilityOpenAICompletions, nil)
+	if err == nil {
+		t.Fatalf("expected missing capability to exclude providers")
+	}
+	if !strings.Contains(err.Error(), `capability "openai.completions"`) {
+		t.Fatalf("unexpected missing capability error: %v", err)
+	}
+}
+
+func TestCacheStatsIncludesCapabilityCounts(t *testing.T) {
+	cache := NewCache()
+	cache.Replace([]Provider{
+		{ID: 1, Provider: "openai", Models: "gpt-4o", Status: StatusEnabled},
+		{
+			ID:                   2,
+			Provider:             "openai",
+			Models:               "embed",
+			Status:               StatusEnabled,
+			EndpointCapabilities: StringList{EndpointCapabilityOpenAIEmbeddings, EndpointCapabilityOpenAIChatCompletions},
+		},
+		{
+			ID:                   3,
+			Provider:             "openai",
+			Models:               "audio",
+			Status:               StatusDisabled,
+			EndpointCapabilities: StringList{EndpointCapabilityOpenAIAudio},
+		},
+	}, 9)
+
+	stats := cache.Stats()
+	if stats.CapabilityCounts[EndpointCapabilityOpenAIChatCompletions] != 2 {
+		t.Fatalf("expected two chat-capable providers, got %+v", stats.CapabilityCounts)
+	}
+	if stats.CapabilityCounts[EndpointCapabilityOpenAICompletions] != 1 {
+		t.Fatalf("expected one text-completion-capable provider, got %+v", stats.CapabilityCounts)
+	}
+	if stats.CapabilityCounts[EndpointCapabilityOpenAIEmbeddings] != 1 {
+		t.Fatalf("expected one embeddings-capable provider, got %+v", stats.CapabilityCounts)
+	}
+	if _, ok := stats.CapabilityCounts[EndpointCapabilityOpenAIAudio]; ok {
+		t.Fatalf("disabled provider capability should not be counted: %+v", stats.CapabilityCounts)
+	}
+}
+
 func TestProviderModelMappingAndKeySelection(t *testing.T) {
 	provider := Provider{
 		APIKey:       "key-a\nkey-b",

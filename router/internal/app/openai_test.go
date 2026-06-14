@@ -1,11 +1,13 @@
 package app
 
 import (
+	"bytes"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -78,6 +80,67 @@ func TestChatCompletionsProxyUsesSelectedProvider(t *testing.T) {
 	}
 	if got := rec.Header().Get("X-Aether-Provider-Version"); got != "11" {
 		t.Fatalf("unexpected provider version header %q", got)
+	}
+}
+
+func TestCompletionsProxyUsesSelectedProvider(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/completions" {
+			t.Fatalf("unexpected upstream path %s", r.URL.Path)
+		}
+
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		if body["model"] != "upstream-text-model" {
+			t.Fatalf("expected mapped model, got %#v", body["model"])
+		}
+		if body["prompt"] != "hello" {
+			t.Fatalf("expected prompt passthrough, got %#v", body["prompt"])
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"cmpl-text","object":"text_completion","choices":[]}`))
+	}))
+	defer upstream.Close()
+
+	cache := store.NewCache()
+	cache.Replace([]store.Provider{{
+		ID:           1,
+		Name:         "text-provider",
+		Provider:     "openai",
+		BaseURL:      upstream.URL + "/v1",
+		APIKey:       "upstream-key",
+		Models:       "public-text-model",
+		ModelMapping: store.StringMap{"public-text-model": "upstream-text-model"},
+		Status:       store.StatusEnabled,
+	}}, 12)
+
+	server := New(config.Config{
+		InstanceID:     "test-router",
+		RequestTimeout: 5 * time.Second,
+		MaxRetries:     0,
+		MaxBodyBytes:   1 << 20,
+	}, nil, cache, slog.Default())
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(`{
+		"model":"public-text-model",
+		"prompt":"hello",
+		"temperature":0.1
+	}`))
+	rec := httptest.NewRecorder()
+
+	server.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Aether-Provider-ID"); got != "1" {
+		t.Fatalf("unexpected provider id header %q", got)
+	}
+	if got := rec.Header().Get("X-Aether-Provider-Name"); got != "text-provider" {
+		t.Fatalf("unexpected provider name header %q", got)
 	}
 }
 
@@ -164,4 +227,665 @@ func TestChatCompletionsIgnoresGroupHintsForSelectionAndDispatch(t *testing.T) {
 	if decoyCalled.Load() {
 		t.Fatalf("decoy provider was selected from group hints")
 	}
+}
+
+func TestChatCompletionsSkipsProviderWithoutEndpointCapability(t *testing.T) {
+	var embeddingsOnlyCalled atomic.Bool
+	embeddingsOnly := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		embeddingsOnlyCalled.Store(true)
+		http.Error(w, "embeddings-only provider should not serve chat", http.StatusInternalServerError)
+	}))
+	defer embeddingsOnly.Close()
+
+	chatProvider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"cmpl-chat","object":"chat.completion","choices":[]}`))
+	}))
+	defer chatProvider.Close()
+
+	server := newOpenAITestServer(t, []store.Provider{
+		{
+			ID:                   1,
+			Name:                 "embeddings-only",
+			Provider:             "openai",
+			BaseURL:              embeddingsOnly.URL + "/v1",
+			Models:               "public-model",
+			Status:               store.StatusEnabled,
+			Priority:             10,
+			EndpointCapabilities: store.StringList{store.EndpointCapabilityOpenAIEmbeddings},
+		},
+		{
+			ID:                   2,
+			Name:                 "chat",
+			Provider:             "openai",
+			BaseURL:              chatProvider.URL + "/v1",
+			Models:               "public-model",
+			Status:               store.StatusEnabled,
+			Priority:             1,
+			EndpointCapabilities: store.StringList{store.EndpointCapabilityOpenAIChatCompletions},
+		},
+	}, config.Config{MaxRetries: 0})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"public-model",
+		"messages":[{"role":"user","content":"hello"}]
+	}`))
+	rec := httptest.NewRecorder()
+
+	server.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if embeddingsOnlyCalled.Load() {
+		t.Fatal("provider without chat capability was selected")
+	}
+	if got := rec.Header().Get("X-Aether-Provider-ID"); got != "2" {
+		t.Fatalf("expected chat provider metadata, got %q", got)
+	}
+}
+
+func TestOpenAICompatibleStreamingResponseFlushesChunksIncrementally(t *testing.T) {
+	firstChunkWritten := make(chan struct{})
+	releaseSecondChunk := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: first\n\n"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		close(firstChunkWritten)
+		<-releaseSecondChunk
+		_, _ = w.Write([]byte("data: second\n\n"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	server := newOpenAITestServer(t, []store.Provider{{
+		ID:       1,
+		Provider: "openai",
+		BaseURL:  upstream.URL + "/v1",
+		Models:   "public-model",
+		Status:   store.StatusEnabled,
+	}}, config.Config{MaxRetries: 0})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"public-model",
+		"stream":true,
+		"messages":[{"role":"user","content":"hello"}]
+	}`))
+	rec := newFlushRecorder()
+	done := make(chan struct{})
+	go func() {
+		server.Routes().ServeHTTP(rec, req)
+		close(done)
+	}()
+
+	select {
+	case <-firstChunkWritten:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream did not write the first chunk")
+	}
+	select {
+	case <-rec.flushed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("router did not flush the first streamed chunk")
+	}
+	if body := rec.BodyString(); !strings.Contains(body, "data: first") {
+		t.Fatalf("expected first chunk before upstream finished, got %q", body)
+	}
+
+	close(releaseSecondChunk)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("route did not finish after upstream stream completed")
+	}
+	if rec.Code() != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code(), rec.BodyString())
+	}
+	if body := rec.BodyString(); !strings.Contains(body, "data: second") {
+		t.Fatalf("expected second chunk after completion, got %q", body)
+	}
+	if rec.FlushCount() == 0 {
+		t.Fatal("expected at least one flush")
+	}
+}
+
+func TestOpenAICompatibleRouteValidation(t *testing.T) {
+	tests := []struct {
+		name        string
+		method      string
+		path        string
+		body        string
+		apiKey      string
+		authHeader  string
+		maxBodySize int64
+		status      int
+		code        string
+	}{
+		{
+			name:   "invalid method",
+			method: http.MethodGet,
+			path:   "/v1/chat/completions",
+			body:   `{"model":"public-model"}`,
+			status: http.StatusMethodNotAllowed,
+			code:   "method_not_allowed",
+		},
+		{
+			name:   "invalid json",
+			method: http.MethodPost,
+			path:   "/v1/chat/completions",
+			body:   `{"model":`,
+			status: http.StatusBadRequest,
+			code:   "invalid_json",
+		},
+		{
+			name:   "missing model",
+			method: http.MethodPost,
+			path:   "/v1/chat/completions",
+			body:   `{"messages":[]}`,
+			status: http.StatusBadRequest,
+			code:   "model_required",
+		},
+		{
+			name:   "empty model",
+			method: http.MethodPost,
+			path:   "/v1/chat/completions",
+			body:   `{"model":"   "}`,
+			status: http.StatusBadRequest,
+			code:   "model_required",
+		},
+		{
+			name:        "oversized body",
+			method:      http.MethodPost,
+			path:        "/v1/completions",
+			body:        `{"model":"public-model"}`,
+			maxBodySize: 8,
+			status:      http.StatusRequestEntityTooLarge,
+			code:        "request_too_large",
+		},
+		{
+			name:       "unauthorized public api key",
+			method:     http.MethodPost,
+			path:       "/v1/chat/completions",
+			body:       `{"model":"public-model"}`,
+			apiKey:     "router-secret",
+			authHeader: "Bearer wrong",
+			status:     http.StatusUnauthorized,
+			code:       "unauthorized",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.Config{
+				InstanceID:     "test-router",
+				RequestTimeout: 5 * time.Second,
+				MaxRetries:     0,
+				MaxBodyBytes:   1 << 20,
+				APIKey:         tt.apiKey,
+			}
+			if tt.maxBodySize > 0 {
+				cfg.MaxBodyBytes = tt.maxBodySize
+			}
+			cache := store.NewCache()
+			server := New(cfg, nil, cache, slog.Default())
+			req := httptest.NewRequest(tt.method, tt.path, strings.NewReader(tt.body))
+			if tt.authHeader != "" {
+				req.Header.Set("Authorization", tt.authHeader)
+			}
+			rec := httptest.NewRecorder()
+
+			server.Routes().ServeHTTP(rec, req)
+
+			if rec.Code != tt.status {
+				t.Fatalf("expected status %d, got %d: %s", tt.status, rec.Code, rec.Body.String())
+			}
+			var envelope openAIError
+			if err := json.NewDecoder(rec.Body).Decode(&envelope); err != nil {
+				t.Fatalf("decode error envelope: %v", err)
+			}
+			if envelope.Error.Code != tt.code {
+				t.Fatalf("expected error code %q, got %q", tt.code, envelope.Error.Code)
+			}
+		})
+	}
+}
+
+func TestOpenAIAdaptorPreservesRequestHeadersAndFiltersHopByHopHeaders(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-API-Key"); got != "Token upstream-key" {
+			t.Fatalf("unexpected custom auth header %q", got)
+		}
+		if got := r.Header.Get("X-Provider-Header"); got != "provider-value" {
+			t.Fatalf("unexpected provider header %q", got)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		if body["model"] != "deployment-a" {
+			t.Fatalf("expected mapped model, got %#v", body["model"])
+		}
+		if body["temperature"] != float64(0.25) {
+			t.Fatalf("expected temperature passthrough, got %#v", body["temperature"])
+		}
+		if _, ok := body["group"]; ok {
+			t.Fatalf("group should not be forwarded upstream")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Upstream-Trace", "kept")
+		_, _ = w.Write([]byte(`{"id":"cmpl-test","object":"chat.completion","choices":[]}`))
+	}))
+	defer upstream.Close()
+
+	server := newOpenAITestServer(t, []store.Provider{{
+		ID:           1,
+		Name:         "custom-provider",
+		Provider:     "openai",
+		BaseURL:      upstream.URL + "/v1",
+		APIKey:       "upstream-key",
+		AuthHeader:   "X-API-Key",
+		AuthPrefix:   "Token ",
+		Models:       "gpt-4o",
+		ModelMapping: store.StringMap{"gpt-4o": "deployment-a"},
+		Headers:      store.StringMap{"X-Provider-Header": "provider-value"},
+		Status:       store.StatusEnabled,
+	}}, config.Config{MaxRetries: 0})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"gpt-4o",
+		"group":"ignored",
+		"temperature":0.25,
+		"messages":[{"role":"user","content":"hello"}]
+	}`))
+	rec := httptest.NewRecorder()
+
+	server.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Upstream-Trace"); got != "kept" {
+		t.Fatalf("expected upstream trace header, got %q", got)
+	}
+	if got := rec.Header().Get("Connection"); got != "" {
+		t.Fatalf("hop-by-hop header should not be forwarded, got %q", got)
+	}
+	if got := rec.Header().Get("X-Aether-Provider-Name"); got != "custom-provider" {
+		t.Fatalf("unexpected provider name header %q", got)
+	}
+}
+
+func TestOpenAIRelayRetriesRetryableStatusWithOriginalBody(t *testing.T) {
+	var firstCalled atomic.Int32
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		firstCalled.Add(1)
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode first upstream body: %v", err)
+		}
+		if body["model"] != "first-upstream" {
+			t.Errorf("expected first mapped model, got %#v", body["model"])
+		}
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+	}))
+	defer first.Close()
+
+	var secondCalled atomic.Int32
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondCalled.Add(1)
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode second upstream body: %v", err)
+		}
+		if body["model"] != "second-upstream" {
+			t.Errorf("expected second mapped model from original request, got %#v", body["model"])
+		}
+		if body["temperature"] != float64(0.7) {
+			t.Errorf("expected replayed temperature, got %#v", body["temperature"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"retried","object":"chat.completion","choices":[]}`))
+	}))
+	defer second.Close()
+
+	server := newOpenAITestServer(t, []store.Provider{
+		{
+			ID:           1,
+			Name:         "first",
+			Provider:     "openai",
+			BaseURL:      first.URL + "/v1",
+			Models:       "public-model",
+			ModelMapping: store.StringMap{"public-model": "first-upstream"},
+			Status:       store.StatusEnabled,
+			Priority:     10,
+		},
+		{
+			ID:           2,
+			Name:         "second",
+			Provider:     "openai",
+			BaseURL:      second.URL + "/v1",
+			Models:       "public-model",
+			ModelMapping: store.StringMap{"public-model": "second-upstream"},
+			Status:       store.StatusEnabled,
+			Priority:     1,
+		},
+	}, config.Config{MaxRetries: 1})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"public-model",
+		"temperature":0.7,
+		"messages":[{"role":"user","content":"hello"}]
+	}`))
+	rec := httptest.NewRecorder()
+
+	server.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if firstCalled.Load() != 1 || secondCalled.Load() != 1 {
+		t.Fatalf("expected one call to each provider, got first=%d second=%d", firstCalled.Load(), secondCalled.Load())
+	}
+	if got := rec.Header().Get("X-Aether-Provider-ID"); got != "2" {
+		t.Fatalf("expected second provider metadata, got %q", got)
+	}
+}
+
+func TestOpenAIRelayRetriesNetworkError(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+
+	var secondCalled atomic.Int32
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondCalled.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"retried","object":"chat.completion","choices":[]}`))
+	}))
+	defer second.Close()
+
+	server := newOpenAITestServer(t, []store.Provider{
+		{
+			ID:       1,
+			Name:     "dead",
+			Provider: "openai",
+			BaseURL:  deadURL + "/v1",
+			Models:   "public-model",
+			Status:   store.StatusEnabled,
+			Priority: 10,
+		},
+		{
+			ID:       2,
+			Name:     "second",
+			Provider: "openai",
+			BaseURL:  second.URL + "/v1",
+			Models:   "public-model",
+			Status:   store.StatusEnabled,
+			Priority: 1,
+		},
+	}, config.Config{MaxRetries: 1})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"public-model",
+		"messages":[{"role":"user","content":"hello"}]
+	}`))
+	rec := httptest.NewRecorder()
+
+	server.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if secondCalled.Load() != 1 {
+		t.Fatalf("expected retry to second provider, got %d calls", secondCalled.Load())
+	}
+}
+
+func TestOpenAIRelayDoesNotRetryNonRetryable4xx(t *testing.T) {
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"bad request"}`))
+	}))
+	defer first.Close()
+
+	var secondCalled atomic.Bool
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondCalled.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer second.Close()
+
+	server := newOpenAITestServer(t, []store.Provider{
+		{
+			ID:       1,
+			Provider: "openai",
+			BaseURL:  first.URL + "/v1",
+			Models:   "public-model",
+			Status:   store.StatusEnabled,
+			Priority: 10,
+		},
+		{
+			ID:       2,
+			Provider: "openai",
+			BaseURL:  second.URL + "/v1",
+			Models:   "public-model",
+			Status:   store.StatusEnabled,
+			Priority: 1,
+		},
+	}, config.Config{MaxRetries: 1})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"public-model",
+		"messages":[{"role":"user","content":"hello"}]
+	}`))
+	rec := httptest.NewRecorder()
+
+	server.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected upstream 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if secondCalled.Load() {
+		t.Fatal("non-retryable 4xx retried another provider")
+	}
+}
+
+func TestOpenAIRelayReturnsUpstreamErrorWhenProvidersExhausted(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unavailable", http.StatusInternalServerError)
+	}))
+	defer upstream.Close()
+
+	server := newOpenAITestServer(t, []store.Provider{{
+		ID:       1,
+		Provider: "openai",
+		BaseURL:  upstream.URL + "/v1",
+		Models:   "public-model",
+		Status:   store.StatusEnabled,
+	}}, config.Config{MaxRetries: 1})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"public-model",
+		"messages":[{"role":"user","content":"hello"}]
+	}`))
+	rec := httptest.NewRecorder()
+
+	server.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var envelope openAIError
+	if err := json.NewDecoder(rec.Body).Decode(&envelope); err != nil {
+		t.Fatalf("decode error envelope: %v", err)
+	}
+	if envelope.Error.Code != "upstream_error" {
+		t.Fatalf("expected upstream_error, got %q", envelope.Error.Code)
+	}
+}
+
+func TestOpenAIRelayDoesNotRetryCommittedStreamingFailure(t *testing.T) {
+	var firstCalled atomic.Int32
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		firstCalled.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Length", "1024")
+		_, _ = w.Write([]byte("data: partial\n\n"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}))
+	defer first.Close()
+
+	var secondCalled atomic.Bool
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondCalled.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer second.Close()
+
+	server := newOpenAITestServer(t, []store.Provider{
+		{
+			ID:       1,
+			Provider: "openai",
+			BaseURL:  first.URL + "/v1",
+			Models:   "public-model",
+			Status:   store.StatusEnabled,
+			Priority: 10,
+		},
+		{
+			ID:       2,
+			Provider: "openai",
+			BaseURL:  second.URL + "/v1",
+			Models:   "public-model",
+			Status:   store.StatusEnabled,
+			Priority: 1,
+		},
+	}, config.Config{MaxRetries: 1})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"public-model",
+		"stream":true,
+		"messages":[{"role":"user","content":"hello"}]
+	}`))
+	rec := httptest.NewRecorder()
+
+	server.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected committed 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "data: partial") {
+		t.Fatalf("expected partial streaming body, got %q", rec.Body.String())
+	}
+	if firstCalled.Load() != 1 {
+		t.Fatalf("expected one first-provider call, got %d", firstCalled.Load())
+	}
+	if secondCalled.Load() {
+		t.Fatal("committed streaming failure retried another provider")
+	}
+}
+
+func newOpenAITestServer(t *testing.T, providers []store.Provider, override config.Config) *Server {
+	t.Helper()
+	cache := store.NewCache()
+	cache.Replace(providers, 42)
+	cfg := config.Config{
+		InstanceID:     "test-router",
+		RequestTimeout: 5 * time.Second,
+		MaxRetries:     0,
+		MaxBodyBytes:   1 << 20,
+	}
+	if override.MaxRetries != 0 {
+		cfg.MaxRetries = override.MaxRetries
+	}
+	if override.MaxBodyBytes != 0 {
+		cfg.MaxBodyBytes = override.MaxBodyBytes
+	}
+	if override.APIKey != "" {
+		cfg.APIKey = override.APIKey
+	}
+	return New(cfg, nil, cache, slog.Default())
+}
+
+type flushRecorder struct {
+	header     http.Header
+	body       bytes.Buffer
+	wrote      chan struct{}
+	flushed    chan struct{}
+	writeOnce  sync.Once
+	flushOnce  sync.Once
+	mu         sync.Mutex
+	statusCode int
+	flushes    int
+}
+
+func newFlushRecorder() *flushRecorder {
+	return &flushRecorder{
+		header:  make(http.Header),
+		wrote:   make(chan struct{}),
+		flushed: make(chan struct{}),
+	}
+}
+
+func (r *flushRecorder) Header() http.Header {
+	return r.header
+}
+
+func (r *flushRecorder) WriteHeader(statusCode int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.statusCode == 0 {
+		r.statusCode = statusCode
+	}
+}
+
+func (r *flushRecorder) Write(data []byte) (int, error) {
+	r.mu.Lock()
+	if r.statusCode == 0 {
+		r.statusCode = http.StatusOK
+	}
+	n, err := r.body.Write(data)
+	r.mu.Unlock()
+	r.writeOnce.Do(func() {
+		close(r.wrote)
+	})
+	return n, err
+}
+
+func (r *flushRecorder) Flush() {
+	r.mu.Lock()
+	r.flushes++
+	r.mu.Unlock()
+	r.flushOnce.Do(func() {
+		close(r.flushed)
+	})
+}
+
+func (r *flushRecorder) Code() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.statusCode == 0 {
+		return http.StatusOK
+	}
+	return r.statusCode
+}
+
+func (r *flushRecorder) BodyString() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.body.String()
+}
+
+func (r *flushRecorder) FlushCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.flushes
 }

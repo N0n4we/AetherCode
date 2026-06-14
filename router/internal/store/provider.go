@@ -25,9 +25,23 @@ const (
 	StatusDisabled            = 2
 	DefaultGroup              = "default"
 	ProviderConfigVersionName = "providers"
+
+	EndpointCapabilityOpenAIChatCompletions = "openai.chat_completions"
+	EndpointCapabilityOpenAICompletions     = "openai.completions"
+	EndpointCapabilityOpenAIEmbeddings      = "openai.embeddings"
+	EndpointCapabilityOpenAIImages          = "openai.images"
+	EndpointCapabilityOpenAIAudio           = "openai.audio"
+	EndpointCapabilityOpenAIResponses       = "openai.responses"
+	EndpointCapabilityOpenAIRerank          = "openai.rerank"
+	EndpointCapabilityClaudeMessages        = "claude.messages"
+	EndpointCapabilityGeminiGenerate        = "gemini.generate"
+	EndpointCapabilityRealtime              = "realtime"
+	EndpointCapabilityTaskVideo             = "task.video"
 )
 
 type StringMap map[string]string
+
+type StringList []string
 
 func (m StringMap) Value() (driver.Value, error) {
 	if len(m) == 0 {
@@ -61,23 +75,67 @@ func (m *StringMap) Scan(value interface{}) error {
 	return json.Unmarshal(data, m)
 }
 
+func (l StringList) Value() (driver.Value, error) {
+	if len(l) == 0 {
+		return "[]", nil
+	}
+	data, err := json.Marshal(l)
+	if err != nil {
+		return nil, err
+	}
+	return string(data), nil
+}
+
+func (l *StringList) Scan(value interface{}) error {
+	if value == nil {
+		*l = StringList{}
+		return nil
+	}
+	var data []byte
+	switch typed := value.(type) {
+	case []byte:
+		data = typed
+	case string:
+		data = []byte(typed)
+	default:
+		return fmt.Errorf("unsupported StringList value %T", value)
+	}
+	if len(strings.TrimSpace(string(data))) == 0 {
+		*l = StringList{}
+		return nil
+	}
+	if strings.HasPrefix(strings.TrimSpace(string(data)), "[") {
+		var values []string
+		if err := json.Unmarshal(data, &values); err != nil {
+			return err
+		}
+		*l = NormalizeEndpointCapabilities(values)
+		return nil
+	}
+	*l = NormalizeEndpointCapabilities(strings.Split(string(data), ","))
+	return nil
+}
+
 type Provider struct {
-	ID           uint      `json:"id" gorm:"primaryKey"`
-	Name         string    `json:"name" gorm:"size:128;index"`
-	Provider     string    `json:"provider" gorm:"size:64;not null;index"`
-	BaseURL      string    `json:"base_url" gorm:"type:text"`
-	APIKey       string    `json:"api_key,omitempty" gorm:"column:api_key;type:text"`
-	AuthHeader   string    `json:"auth_header" gorm:"size:64"`
-	AuthPrefix   string    `json:"auth_prefix" gorm:"size:64"`
-	Models       string    `json:"models" gorm:"type:text;not null"`
-	Groups       string    `json:"groups" gorm:"type:text;not null;default:'default'"`
-	ModelMapping StringMap `json:"model_mapping" gorm:"type:text"`
-	Headers      StringMap `json:"headers" gorm:"type:text"`
-	Status       int       `json:"status" gorm:"default:1;index"`
-	Weight       uint      `json:"weight" gorm:"default:0"`
-	Priority     int64     `json:"priority" gorm:"default:0;index"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ID                   uint       `json:"id" gorm:"primaryKey"`
+	Name                 string     `json:"name" gorm:"size:128;index"`
+	Provider             string     `json:"provider" gorm:"size:64;not null;index"`
+	BaseURL              string     `json:"base_url" gorm:"type:text"`
+	APIKey               string     `json:"api_key,omitempty" gorm:"column:api_key;type:text"`
+	AuthHeader           string     `json:"auth_header" gorm:"size:64"`
+	AuthPrefix           string     `json:"auth_prefix" gorm:"size:64"`
+	Models               string     `json:"models" gorm:"type:text;not null"`
+	Groups               string     `json:"groups" gorm:"type:text;not null;default:'default'"`
+	ModelMapping         StringMap  `json:"model_mapping" gorm:"type:text"`
+	Headers              StringMap  `json:"headers" gorm:"type:text"`
+	EndpointCapabilities StringList `json:"endpoint_capabilities" gorm:"type:text"`
+	ChannelType          string     `json:"channel_type" gorm:"size:64"`
+	RelayFormat          string     `json:"relay_format" gorm:"size:64"`
+	Status               int        `json:"status" gorm:"default:1;index"`
+	Weight               uint       `json:"weight" gorm:"default:0"`
+	Priority             int64      `json:"priority" gorm:"default:0;index"`
+	CreatedAt            time.Time  `json:"created_at"`
+	UpdatedAt            time.Time  `json:"updated_at"`
 }
 
 type ConfigVersion struct {
@@ -108,6 +166,8 @@ func (p *Provider) applyDefaults() {
 	p.Provider = strings.TrimSpace(p.Provider)
 	p.Name = strings.TrimSpace(p.Name)
 	p.BaseURL = strings.TrimSpace(p.BaseURL)
+	p.ChannelType = strings.TrimSpace(p.ChannelType)
+	p.RelayFormat = strings.TrimSpace(p.RelayFormat)
 	p.Models = strings.Trim(strings.TrimSpace(p.Models), ",")
 	p.Groups = strings.Trim(strings.TrimSpace(p.Groups), ",")
 	if p.Groups == "" {
@@ -122,44 +182,54 @@ func (p *Provider) applyDefaults() {
 	if p.Headers == nil {
 		p.Headers = StringMap{}
 	}
+	p.EndpointCapabilities = NormalizeEndpointCapabilities(p.EndpointCapabilities)
+	if len(p.EndpointCapabilities) == 0 {
+		p.EndpointCapabilities = DefaultEndpointCapabilities()
+	}
 }
 
 func (p Provider) Public() PublicProvider {
 	return PublicProvider{
-		ID:           p.ID,
-		Name:         p.Name,
-		Provider:     p.Provider,
-		BaseURL:      p.BaseURL,
-		AuthHeader:   p.AuthHeader,
-		AuthPrefix:   p.AuthPrefix,
-		Models:       p.Models,
-		Groups:       p.Groups,
-		ModelMapping: p.ModelMapping,
-		Headers:      p.Headers,
-		Status:       p.Status,
-		Weight:       p.Weight,
-		Priority:     p.Priority,
-		CreatedAt:    p.CreatedAt,
-		UpdatedAt:    p.UpdatedAt,
+		ID:                   p.ID,
+		Name:                 p.Name,
+		Provider:             p.Provider,
+		BaseURL:              p.BaseURL,
+		AuthHeader:           p.AuthHeader,
+		AuthPrefix:           p.AuthPrefix,
+		Models:               p.Models,
+		Groups:               p.Groups,
+		ModelMapping:         p.ModelMapping,
+		Headers:              p.Headers,
+		EndpointCapabilities: p.NormalizedEndpointCapabilities(),
+		ChannelType:          p.ChannelType,
+		RelayFormat:          p.RelayFormat,
+		Status:               p.Status,
+		Weight:               p.Weight,
+		Priority:             p.Priority,
+		CreatedAt:            p.CreatedAt,
+		UpdatedAt:            p.UpdatedAt,
 	}
 }
 
 type PublicProvider struct {
-	ID           uint      `json:"id"`
-	Name         string    `json:"name"`
-	Provider     string    `json:"provider"`
-	BaseURL      string    `json:"base_url"`
-	AuthHeader   string    `json:"auth_header"`
-	AuthPrefix   string    `json:"auth_prefix"`
-	Models       string    `json:"models"`
-	Groups       string    `json:"groups"`
-	ModelMapping StringMap `json:"model_mapping"`
-	Headers      StringMap `json:"headers"`
-	Status       int       `json:"status"`
-	Weight       uint      `json:"weight"`
-	Priority     int64     `json:"priority"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ID                   uint       `json:"id"`
+	Name                 string     `json:"name"`
+	Provider             string     `json:"provider"`
+	BaseURL              string     `json:"base_url"`
+	AuthHeader           string     `json:"auth_header"`
+	AuthPrefix           string     `json:"auth_prefix"`
+	Models               string     `json:"models"`
+	Groups               string     `json:"groups"`
+	ModelMapping         StringMap  `json:"model_mapping"`
+	Headers              StringMap  `json:"headers"`
+	EndpointCapabilities StringList `json:"endpoint_capabilities"`
+	ChannelType          string     `json:"channel_type"`
+	RelayFormat          string     `json:"relay_format"`
+	Status               int        `json:"status"`
+	Weight               uint       `json:"weight"`
+	Priority             int64      `json:"priority"`
+	CreatedAt            time.Time  `json:"created_at"`
+	UpdatedAt            time.Time  `json:"updated_at"`
 }
 
 func (p Provider) GroupList() []string {
@@ -168,6 +238,27 @@ func (p Provider) GroupList() []string {
 
 func (p Provider) ModelList() []string {
 	return splitCSV(p.Models, "")
+}
+
+func (p Provider) NormalizedEndpointCapabilities() StringList {
+	capabilities := NormalizeEndpointCapabilities(p.EndpointCapabilities)
+	if len(capabilities) == 0 {
+		return DefaultEndpointCapabilities()
+	}
+	return capabilities
+}
+
+func (p Provider) SupportsCapability(capability string) bool {
+	capability = NormalizeEndpointCapability(capability)
+	if capability == "" {
+		return true
+	}
+	for _, configured := range p.NormalizedEndpointCapabilities() {
+		if configured == capability {
+			return true
+		}
+	}
+	return false
 }
 
 func (p Provider) UpstreamModel(model string) string {
@@ -200,6 +291,31 @@ func (p Provider) AuthPrefixOrDefault() string {
 		return "Bearer "
 	}
 	return ""
+}
+
+func DefaultEndpointCapabilities() StringList {
+	return StringList{
+		EndpointCapabilityOpenAIChatCompletions,
+		EndpointCapabilityOpenAICompletions,
+	}
+}
+
+func NormalizeEndpointCapability(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func NormalizeEndpointCapabilities(values []string) StringList {
+	out := make(StringList, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		normalized := NormalizeEndpointCapability(value)
+		if normalized == "" || seen[normalized] {
+			continue
+		}
+		seen[normalized] = true
+		out = append(out, normalized)
+	}
+	return out
 }
 
 func splitCSV(value string, fallback string) []string {
@@ -385,12 +501,18 @@ func NewCache() *Cache {
 }
 
 type CacheStats struct {
-	Version              int64     `json:"version"`
-	LastSyncedAt         time.Time `json:"last_synced_at"`
-	ProviderCount        int       `json:"provider_count"`
-	EnabledProviderCount int       `json:"enabled_provider_count"`
-	GroupCount           int       `json:"group_count"`
-	ModelCount           int       `json:"model_count"`
+	Version              int64          `json:"version"`
+	LastSyncedAt         time.Time      `json:"last_synced_at"`
+	ProviderCount        int            `json:"provider_count"`
+	EnabledProviderCount int            `json:"enabled_provider_count"`
+	GroupCount           int            `json:"group_count"`
+	ModelCount           int            `json:"model_count"`
+	CapabilityCounts     map[string]int `json:"capability_counts"`
+}
+
+type ModelMetadata struct {
+	ID           string
+	Capabilities StringList
 }
 
 func ReloadCache(ctx context.Context, db *Store, cache *Cache) (int64, error) {
@@ -478,9 +600,13 @@ func (c *Cache) Stats() CacheStats {
 	defer c.mu.RUnlock()
 
 	enabled := 0
+	capabilityCounts := map[string]int{}
 	for _, provider := range c.byID {
 		if provider.Status == StatusEnabled {
 			enabled++
+			for _, capability := range provider.NormalizedEndpointCapabilities() {
+				capabilityCounts[capability]++
+			}
 		}
 	}
 	return CacheStats{
@@ -490,14 +616,20 @@ func (c *Cache) Stats() CacheStats {
 		EnabledProviderCount: enabled,
 		GroupCount:           0,
 		ModelCount:           len(c.byModel),
+		CapabilityCounts:     capabilityCounts,
 	}
 }
 
 func (c *Cache) Select(model string, excluded map[uint]bool) (*Provider, error) {
+	return c.SelectForCapability(model, "", excluded)
+}
+
+func (c *Cache) SelectForCapability(model string, capability string, excluded map[uint]bool) (*Provider, error) {
 	model = strings.TrimSpace(model)
 	if model == "" {
 		return nil, errors.New("model is required")
 	}
+	capability = NormalizeEndpointCapability(capability)
 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -513,11 +645,14 @@ func (c *Cache) Select(model string, excluded map[uint]bool) (*Provider, error) 
 			continue
 		}
 		provider, ok := c.byID[id]
-		if ok && provider.Status == StatusEnabled {
+		if ok && provider.Status == StatusEnabled && provider.SupportsCapability(capability) {
 			candidates = append(candidates, provider)
 		}
 	}
 	if len(candidates) == 0 {
+		if capability != "" {
+			return nil, fmt.Errorf("no remaining provider for model %q and capability %q", model, capability)
+		}
 		return nil, fmt.Errorf("no remaining provider for model %q", model)
 	}
 
@@ -531,6 +666,57 @@ func (c *Cache) Select(model string, excluded map[uint]bool) (*Provider, error) 
 
 	selected := pickWeighted(samePriority)
 	return &selected, nil
+}
+
+func (c *Cache) Models() []ModelMetadata {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	models := make([]ModelMetadata, 0, len(c.byModel))
+	for model, ids := range c.byModel {
+		if model == "*" {
+			continue
+		}
+		capabilitySet := map[string]bool{}
+		for _, id := range ids {
+			provider, ok := c.byID[id]
+			if !ok || provider.Status != StatusEnabled {
+				continue
+			}
+			for _, capability := range provider.NormalizedEndpointCapabilities() {
+				capabilitySet[capability] = true
+			}
+		}
+		if len(capabilitySet) == 0 {
+			continue
+		}
+		capabilities := make(StringList, 0, len(capabilitySet))
+		for capability := range capabilitySet {
+			capabilities = append(capabilities, capability)
+		}
+		sort.Strings(capabilities)
+		models = append(models, ModelMetadata{
+			ID:           model,
+			Capabilities: capabilities,
+		})
+	}
+	sort.Slice(models, func(i, j int) bool {
+		return models[i].ID < models[j].ID
+	})
+	return models
+}
+
+func (c *Cache) Model(model string) (ModelMetadata, bool) {
+	model = strings.TrimSpace(model)
+	if model == "" || model == "*" {
+		return ModelMetadata{}, false
+	}
+	for _, candidate := range c.Models() {
+		if candidate.ID == model {
+			return candidate, true
+		}
+	}
+	return ModelMetadata{}, false
 }
 
 func (c *Cache) idsForLocked(model string) []uint {
