@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"time"
 
 	"aethercode-router/internal/store"
 	"aethercode-router/internal/upstream"
@@ -156,6 +157,15 @@ func (s *Server) handleRelayRoute(w http.ResponseWriter, r *http.Request, descri
 		if !s.checkPublicAuth(w, r) {
 			return
 		}
+		now := time.Now()
+		s.recordRelayUsage(r, relayUsageRecord{
+			StartedAt:          now,
+			CompletedAt:        now,
+			EndpointCapability: descriptor.Capability,
+			Outcome:            store.UsageOutcomeFailed,
+			StatusCode:         http.StatusNotImplemented,
+			ErrorCode:          "unsupported_endpoint",
+		})
 		writeUnsupportedEndpoint(w, descriptor)
 	default:
 		writeOpenAIError(w, http.StatusInternalServerError, "api_error", "unsupported_route_status", "unsupported route status")

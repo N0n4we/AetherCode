@@ -131,11 +131,23 @@ func (s *Server) adminStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	keyVersion, err := s.store.APIKeyVersion(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	channelVersion, err := s.store.ProviderChannelVersion(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	stats := s.cache.Stats()
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"instance_id": s.cfg.InstanceID,
 		"database": map[string]interface{}{
-			"provider_version": dbVersion,
+			"provider_version":         dbVersion,
+			"provider_channel_version": channelVersion,
+			"api_key_version":          keyVersion,
 		},
 		"cache":   stats,
 		"in_sync": stats.Version == dbVersion,

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"aethercode-router/internal/store"
 	"aethercode-router/internal/upstream"
@@ -35,8 +36,9 @@ type selectedProviderMetadata struct {
 }
 
 type relayAttemptState struct {
-	attempted map[uint]bool
-	lastErr   error
+	attempted    map[uint]bool
+	lastErr      error
+	lastSelected *selectedProviderMetadata
 }
 
 type openAICompatibleAdaptorResult struct {
@@ -71,17 +73,26 @@ func (s *Server) openAIRoute(kind upstream.Kind) http.HandlerFunc {
 			writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method_not_allowed", "method not allowed")
 			return
 		}
+		startedAt := time.Now()
 		if !s.checkPublicAuth(w, r) {
 			return
 		}
 
 		envelope, validationErr := s.openAICompatibleEnvelope(w, r, kind)
 		if validationErr != nil {
+			s.recordRelayUsage(r, relayUsageRecord{
+				StartedAt:          startedAt,
+				CompletedAt:        time.Now(),
+				EndpointCapability: openAIEndpointCapability(kind),
+				Outcome:            store.UsageOutcomeFailed,
+				StatusCode:         validationErr.status,
+				ErrorCode:          validationErr.code,
+			})
 			writeOpenAIError(w, validationErr.status, validationErr.typ, validationErr.code, validationErr.message)
 			return
 		}
 
-		s.relayOpenAICompatible(w, r, envelope)
+		s.relayOpenAICompatible(w, r, envelope, startedAt)
 	}
 }
 
@@ -124,8 +135,17 @@ func (s *Server) openAICompatibleEnvelope(w http.ResponseWriter, r *http.Request
 	}, nil
 }
 
-func (s *Server) relayOpenAICompatible(w http.ResponseWriter, r *http.Request, envelope *openAICompatibleRequestEnvelope) {
+func (s *Server) relayOpenAICompatible(w http.ResponseWriter, r *http.Request, envelope *openAICompatibleRequestEnvelope, startedAt time.Time) {
 	if envelope.format != openAICompatibleFormat {
+		s.recordRelayUsage(r, relayUsageRecord{
+			StartedAt:          startedAt,
+			CompletedAt:        time.Now(),
+			ModelID:            envelope.body.model,
+			EndpointCapability: openAIEndpointCapability(envelope.kind),
+			Outcome:            store.UsageOutcomeFailed,
+			StatusCode:         http.StatusInternalServerError,
+			ErrorCode:          "unsupported_relay_format",
+		})
 		writeOpenAIError(w, http.StatusInternalServerError, "api_error", "unsupported_relay_format", "unsupported relay format")
 		return
 	}
@@ -137,12 +157,32 @@ func (s *Server) relayOpenAICompatible(w http.ResponseWriter, r *http.Request, e
 		selected, err := s.selectOpenAICompatibleProvider(envelope, state)
 		if err != nil {
 			if state.hasAttempted() && state.lastErr != nil {
+				s.recordRelayUsage(r, relayUsageRecord{
+					StartedAt:          startedAt,
+					CompletedAt:        time.Now(),
+					ModelID:            envelope.body.model,
+					Selected:           state.lastSelected,
+					EndpointCapability: openAIEndpointCapability(envelope.kind),
+					Outcome:            store.UsageOutcomeFailed,
+					StatusCode:         http.StatusBadGateway,
+					ErrorCode:          "upstream_error",
+				})
 				writeOpenAIUpstreamError(w, state.lastErr)
 				return
 			}
+			s.recordRelayUsage(r, relayUsageRecord{
+				StartedAt:          startedAt,
+				CompletedAt:        time.Now(),
+				ModelID:            envelope.body.model,
+				EndpointCapability: openAIEndpointCapability(envelope.kind),
+				Outcome:            store.UsageOutcomeFailed,
+				StatusCode:         http.StatusServiceUnavailable,
+				ErrorCode:          "model_not_found",
+			})
 			writeOpenAIError(w, http.StatusServiceUnavailable, "invalid_request_error", "model_not_found", err.Error())
 			return
 		}
+		state.lastSelected = selected
 
 		result := adaptor.send(r.Context(), s.upstream, envelope, selected)
 		if result.err != nil {
@@ -168,9 +208,38 @@ func (s *Server) relayOpenAICompatible(w http.ResponseWriter, r *http.Request, e
 		if err := copyUpstreamResponse(w, result.response, tracker); err != nil {
 			s.logger.Warn("copy upstream response failed", "provider_id", selected.provider.ID, "committed", tracker.Committed(), "error", err)
 		}
+		statusCode := tracker.statusCode
+		if statusCode == 0 {
+			statusCode = result.response.StatusCode
+		}
+		outcome := store.UsageOutcomeSuccess
+		if statusCode >= 400 {
+			outcome = store.UsageOutcomeFailed
+		}
+		s.recordRelayUsage(r, relayUsageRecord{
+			StartedAt:          startedAt,
+			CompletedAt:        time.Now(),
+			ModelID:            envelope.body.model,
+			Selected:           selected,
+			EndpointCapability: openAIEndpointCapability(envelope.kind),
+			Outcome:            outcome,
+			StatusCode:         statusCode,
+			UpstreamStatus:     result.response.StatusCode,
+			CacheState:         cacheStateFromResponse(result.response),
+		})
 		return
 	}
 
+	s.recordRelayUsage(r, relayUsageRecord{
+		StartedAt:          startedAt,
+		CompletedAt:        time.Now(),
+		ModelID:            envelope.body.model,
+		Selected:           state.lastSelected,
+		EndpointCapability: openAIEndpointCapability(envelope.kind),
+		Outcome:            store.UsageOutcomeFailed,
+		StatusCode:         http.StatusBadGateway,
+		ErrorCode:          "upstream_error",
+	})
 	writeOpenAIUpstreamError(w, state.lastErr)
 }
 

@@ -16,6 +16,9 @@ type Config struct {
 	MaxBodyBytes       int64
 	APIKey             string
 	AdminKey           string
+	AccountKeyAuth     bool
+	APIKeyHashSecret   string
+	AccountServiceKey  string
 }
 
 func Load() Config {
@@ -29,6 +32,9 @@ func Load() Config {
 		MaxBodyBytes:       int64(getInt("MAX_BODY_BYTES", 32<<20)),
 		APIKey:             os.Getenv("ROUTER_API_KEY"),
 		AdminKey:           os.Getenv("ROUTER_ADMIN_KEY"),
+		AccountKeyAuth:     getBool("RELAY_ACCOUNT_KEY_AUTH", false),
+		APIKeyHashSecret:   os.Getenv("API_KEY_HASH_SECRET"),
+		AccountServiceKey:  getenv("ACCOUNT_SERVICE_KEY", os.Getenv("ROUTER_ADMIN_KEY")),
 	}
 }
 
@@ -65,6 +71,18 @@ func getInt(key string, fallback int) int {
 		return fallback
 	}
 	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func getBool(key string, fallback bool) bool {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(value)
 	if err != nil {
 		return fallback
 	}

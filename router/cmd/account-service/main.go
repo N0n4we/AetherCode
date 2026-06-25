@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"aethercode-router/internal/app"
+	"aethercode-router/internal/account"
 	"aethercode-router/internal/config"
 	"aethercode-router/internal/store"
 )
@@ -25,32 +25,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	cache := store.NewCache()
-	version, err := store.ReloadCache(context.Background(), db, cache)
-	if err != nil {
-		logger.Error("load provider cache", "error", err)
-		os.Exit(1)
-	}
-	logger.Info("provider cache loaded", "version", version)
-
-	srv := app.New(cfg, db, cache, logger)
-	keyCache := store.NewAPIKeyCache()
-	if cfg.AccountKeyAuth {
-		keyVersion, err := store.ReloadAPIKeyCache(context.Background(), db, keyCache)
-		if err != nil {
-			logger.Error("load api key cache", "error", err)
-			os.Exit(1)
-		}
-		srv.SetAPIKeyCache(keyCache)
-		logger.Info("api key cache loaded", "version", keyVersion)
-	}
+	srv := account.New(cfg, db)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
-	go store.SyncCache(ctx, db, cache, cfg.ConfigSyncInterval, logger)
-	if cfg.AccountKeyAuth {
-		go store.SyncAPIKeyCache(ctx, db, keyCache, cfg.ConfigSyncInterval, logger)
-	}
 
 	httpServer := &http.Server{
 		Addr:              cfg.Addr,
@@ -59,7 +36,7 @@ func main() {
 	}
 
 	go func() {
-		logger.Info("router listening", "addr", cfg.Addr)
+		logger.Info("account service listening", "addr", cfg.Addr)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("listen", "error", err)
 			os.Exit(1)

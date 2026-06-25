@@ -108,7 +108,7 @@ Rollback should preserve existing relay routes and allow operators to fall back 
 
 ## Open Questions
 
-- Which cloud provider and managed Kubernetes/RDB products should be the first Terraform target?
+- First Terraform target: Google Cloud GKE Autopilot for Kubernetes and Cloud SQL for PostgreSQL as the managed RDB. This keeps the initial cluster best-effort and low-operations while using a PostgreSQL backend already supported by the router.
 - Should the account service be implemented in Go to share router libraries, or as a separate stack?
 - Should billing block responses on successful charge recording, or allow asynchronous charging with account balance safeguards?
 - How should upstream cache hit state be normalized across providers that expose different usage metadata?

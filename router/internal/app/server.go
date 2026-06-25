@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -15,9 +16,13 @@ type Server struct {
 	cfg      config.Config
 	store    *store.Store
 	cache    *store.Cache
+	keyCache *store.APIKeyCache
 	upstream *upstream.Client
 	logger   *slog.Logger
 }
+
+type authContextKey struct{}
+type usageEventContextKey struct{}
 
 func New(cfg config.Config, db *store.Store, cache *store.Cache, logger *slog.Logger) *Server {
 	if logger == nil {
@@ -32,6 +37,10 @@ func New(cfg config.Config, db *store.Store, cache *store.Cache, logger *slog.Lo
 	}
 }
 
+func (s *Server) SetAPIKeyCache(cache *store.APIKeyCache) {
+	s.keyCache = cache
+}
+
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.health)
@@ -39,6 +48,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/internal/status", s.adminStatus)
 	mux.HandleFunc("/internal/providers", s.adminProviders)
 	mux.HandleFunc("/internal/providers/", s.adminProviderByID)
+	mux.HandleFunc("/internal/provider-channels", s.adminProviderChannels)
+	mux.HandleFunc("/internal/provider-channels/", s.adminProviderChannelByID)
 	mux.HandleFunc("/", s.relayRouteHandler())
 	return mux
 }
@@ -61,6 +72,21 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 			"cache_loaded": stats.Version > 0,
 		})
 		return
+	}
+	if s.cfg.AccountKeyAuth {
+		keyVersion, err := s.store.APIKeyVersion(r.Context())
+		if err != nil || s.keyCache == nil || s.keyCache.Version() == 0 || s.keyCache.Version() < keyVersion {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":          "not_ready",
+				"cache":           stats,
+				"db_version":      dbVersion,
+				"api_key_version": keyVersion,
+				"api_key_loaded":  s.keyCache != nil && s.keyCache.Version() > 0,
+			})
+			return
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -89,14 +115,57 @@ func keyFromRequest(r *http.Request) string {
 }
 
 func (s *Server) checkPublicAuth(w http.ResponseWriter, r *http.Request) bool {
-	if s.cfg.APIKey == "" {
+	identity, err := s.authenticatePublicRequest(r)
+	if err == nil {
+		ctx := r.Context()
+		if identity != nil {
+			ctx = context.WithValue(ctx, authContextKey{}, identity)
+		}
+		ctx = context.WithValue(ctx, usageEventContextKey{}, randomRequestToken())
+		*r = *r.WithContext(ctx)
 		return true
 	}
-	if keyFromRequest(r) == s.cfg.APIKey {
-		return true
-	}
-	writeOpenAIError(w, http.StatusUnauthorized, "invalid_request_error", "unauthorized", "invalid router API key")
+	writeOpenAIError(w, http.StatusUnauthorized, "invalid_request_error", "unauthorized", err.Error())
 	return false
+}
+
+func (s *Server) authenticatePublicRequest(r *http.Request) (*store.AuthIdentity, error) {
+	raw := keyFromRequest(r)
+	if s.cfg.APIKey != "" && raw == s.cfg.APIKey {
+		return &store.AuthIdentity{Source: "static_router_api_key"}, nil
+	}
+	if s.cfg.AccountKeyAuth {
+		if raw == "" {
+			return nil, errUnauthorized("missing relay API key")
+		}
+		if s.keyCache != nil && s.keyCache.Version() > 0 {
+			return s.keyCache.Validate(raw, s.cfg.APIKeyHashSecret)
+		}
+		if s.store != nil {
+			return s.store.ValidateAPIKey(r.Context(), raw, s.cfg.APIKeyHashSecret)
+		}
+		return nil, errUnauthorized("account API key validation is unavailable")
+	}
+	if s.cfg.APIKey != "" {
+		return nil, errUnauthorized("invalid router API key")
+	}
+	return nil, nil
+}
+
+type errUnauthorized string
+
+func (e errUnauthorized) Error() string {
+	return string(e)
+}
+
+func authIdentityFromContext(ctx context.Context) (*store.AuthIdentity, bool) {
+	identity, ok := ctx.Value(authContextKey{}).(*store.AuthIdentity)
+	return identity, ok && identity != nil
+}
+
+func usageEventTokenFromContext(ctx context.Context) string {
+	token, _ := ctx.Value(usageEventContextKey{}).(string)
+	return token
 }
 
 func (s *Server) checkAdminAuth(w http.ResponseWriter, r *http.Request) bool {

@@ -2,10 +2,12 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -790,6 +792,270 @@ func TestOpenAIRelayDoesNotRetryCommittedStreamingFailure(t *testing.T) {
 	}
 	if secondCalled.Load() {
 		t.Fatal("committed streaming failure retried another provider")
+	}
+}
+
+func TestRelayAccountAPIKeyAuthenticationStatesAndUsageBilling(t *testing.T) {
+	ctx := context.Background()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Aether-Cache", "hit")
+		_, _ = w.Write([]byte(`{"id":"cmpl-account","object":"chat.completion","choices":[]}`))
+	}))
+	defer upstream.Close()
+
+	db, err := store.Open("sqlite://" + filepath.Join(t.TempDir(), "relay.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := db.CreateProvider(ctx, &store.Provider{
+		Name:     "account-provider",
+		Provider: "openai",
+		BaseURL:  upstream.URL + "/v1",
+		Models:   "public-model",
+		Status:   store.StatusEnabled,
+	}); err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	if err := db.CreatePriceConfig(ctx, &store.PriceConfig{
+		PublicModelID:   "public-model",
+		UsageClass:      store.UsageClassRequest,
+		CacheState:      "hit",
+		UnitPriceMicros: 25,
+	}); err != nil {
+		t.Fatalf("create price: %v", err)
+	}
+	created, err := db.CreateAPIKey(ctx, "acct-relay", "relay key", "hash-secret")
+	if err != nil {
+		t.Fatalf("create api key: %v", err)
+	}
+
+	providerCache := store.NewCache()
+	if _, err := store.ReloadCache(ctx, db, providerCache); err != nil {
+		t.Fatalf("reload provider cache: %v", err)
+	}
+	keyCache := store.NewAPIKeyCache()
+	if _, err := store.ReloadAPIKeyCache(ctx, db, keyCache); err != nil {
+		t.Fatalf("reload api key cache: %v", err)
+	}
+	server := New(config.Config{
+		InstanceID:         "test-router",
+		RequestTimeout:     5 * time.Second,
+		MaxRetries:         0,
+		MaxBodyBytes:       1 << 20,
+		AccountKeyAuth:     true,
+		APIKeyHashSecret:   "hash-secret",
+		ConfigSyncInterval: time.Second,
+	}, db, providerCache, slog.Default())
+	server.SetAPIKeyCache(keyCache)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"public-model",
+		"messages":[{"role":"user","content":"hello"}]
+	}`))
+	req.Header.Set("Authorization", "Bearer "+created.Secret)
+	req.Header.Set("X-Request-ID", "relay-auth-success")
+	rec := httptest.NewRecorder()
+	server.Routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected active key 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var events []store.UsageEvent
+	if err := db.DB().Find(&events).Error; err != nil {
+		t.Fatalf("query usage events: %v", err)
+	}
+	if len(events) != 1 || events[0].AccountID == 0 || events[0].APIKeyID != created.ID || events[0].CacheState != "hit" {
+		t.Fatalf("unexpected usage events: %+v", events)
+	}
+	var charges []store.BillableCharge
+	if err := db.DB().Find(&charges).Error; err != nil {
+		t.Fatalf("query charges: %v", err)
+	}
+	if len(charges) != 1 || charges[0].AmountMicros != 25 {
+		t.Fatalf("unexpected billable charges: %+v", charges)
+	}
+
+	missingReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"public-model"}`))
+	missingRec := httptest.NewRecorder()
+	server.Routes().ServeHTTP(missingRec, missingReq)
+	if missingRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected missing key 401, got %d: %s", missingRec.Code, missingRec.Body.String())
+	}
+
+	if _, err := db.DisableAPIKey(ctx, "acct-relay", created.ID); err != nil {
+		t.Fatalf("disable key: %v", err)
+	}
+	if _, err := store.ReloadAPIKeyCache(ctx, db, keyCache); err != nil {
+		t.Fatalf("reload disabled key cache: %v", err)
+	}
+	disabledReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"public-model"}`))
+	disabledReq.Header.Set("Authorization", "Bearer "+created.Secret)
+	disabledRec := httptest.NewRecorder()
+	server.Routes().ServeHTTP(disabledRec, disabledReq)
+	if disabledRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected disabled key 401, got %d: %s", disabledRec.Code, disabledRec.Body.String())
+	}
+
+	revoked, err := db.CreateAPIKey(ctx, "acct-relay", "revoked key", "hash-secret")
+	if err != nil {
+		t.Fatalf("create revoked key: %v", err)
+	}
+	if _, err := db.RevokeAPIKey(ctx, "acct-relay", revoked.ID); err != nil {
+		t.Fatalf("revoke key: %v", err)
+	}
+	if _, err := store.ReloadAPIKeyCache(ctx, db, keyCache); err != nil {
+		t.Fatalf("reload revoked key cache: %v", err)
+	}
+	revokedReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"public-model"}`))
+	revokedReq.Header.Set("Authorization", "Bearer "+revoked.Secret)
+	revokedRec := httptest.NewRecorder()
+	server.Routes().ServeHTTP(revokedRec, revokedReq)
+	if revokedRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected revoked key 401, got %d: %s", revokedRec.Code, revokedRec.Body.String())
+	}
+}
+
+func TestRelayUsageDoesNotDeduplicateDistinctRequestsByClientRequestID(t *testing.T) {
+	ctx := context.Background()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"cmpl-account","object":"chat.completion","choices":[]}`))
+	}))
+	defer upstream.Close()
+
+	db, err := store.Open("sqlite://" + filepath.Join(t.TempDir(), "relay.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := db.CreateProvider(ctx, &store.Provider{
+		Name:     "account-provider",
+		Provider: "openai",
+		BaseURL:  upstream.URL + "/v1",
+		Models:   "public-model",
+		Status:   store.StatusEnabled,
+	}); err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	if err := db.CreatePriceConfig(ctx, &store.PriceConfig{
+		PublicModelID:   "public-model",
+		UsageClass:      store.UsageClassRequest,
+		CacheState:      store.CacheStateUnknown,
+		UnitPriceMicros: 10,
+	}); err != nil {
+		t.Fatalf("create price: %v", err)
+	}
+	created, err := db.CreateAPIKey(ctx, "acct-relay", "relay key", "hash-secret")
+	if err != nil {
+		t.Fatalf("create api key: %v", err)
+	}
+
+	providerCache := store.NewCache()
+	if _, err := store.ReloadCache(ctx, db, providerCache); err != nil {
+		t.Fatalf("reload provider cache: %v", err)
+	}
+	keyCache := store.NewAPIKeyCache()
+	if _, err := store.ReloadAPIKeyCache(ctx, db, keyCache); err != nil {
+		t.Fatalf("reload api key cache: %v", err)
+	}
+	server := New(config.Config{
+		InstanceID:       "test-router",
+		RequestTimeout:   5 * time.Second,
+		MaxRetries:       0,
+		MaxBodyBytes:     1 << 20,
+		AccountKeyAuth:   true,
+		APIKeyHashSecret: "hash-secret",
+	}, db, providerCache, slog.Default())
+	server.SetAPIKeyCache(keyCache)
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+			"model":"public-model",
+			"messages":[{"role":"user","content":"hello"}]
+		}`))
+		req.Header.Set("Authorization", "Bearer "+created.Secret)
+		req.Header.Set("X-Request-ID", "client-reused-request-id")
+		rec := httptest.NewRecorder()
+		server.Routes().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d expected 200, got %d: %s", i+1, rec.Code, rec.Body.String())
+		}
+	}
+
+	var events []store.UsageEvent
+	if err := db.DB().Order("id asc").Find(&events).Error; err != nil {
+		t.Fatalf("query usage events: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected two usage events for two distinct requests with reused client request id, got %+v", events)
+	}
+	if events[0].EventID == events[1].EventID {
+		t.Fatalf("distinct requests should not share usage event id %q", events[0].EventID)
+	}
+	for _, event := range events {
+		if event.RequestID != "client-reused-request-id" {
+			t.Fatalf("client request id should remain trace metadata, got %+v", event)
+		}
+	}
+
+	var charges []store.BillableCharge
+	if err := db.DB().Order("id asc").Find(&charges).Error; err != nil {
+		t.Fatalf("query charges: %v", err)
+	}
+	if len(charges) != 2 {
+		t.Fatalf("expected two billable charges, got %+v", charges)
+	}
+}
+
+func TestProviderChannelSecretRefSuppliesUpstreamAPIKey(t *testing.T) {
+	ctx := context.Background()
+	var seenAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"cmpl-channel","object":"chat.completion","choices":[]}`))
+	}))
+	defer upstream.Close()
+
+	db, err := store.Open("sqlite://" + filepath.Join(t.TempDir(), "channel.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := db.CreateProviderChannel(ctx, &store.ProviderChannel{
+		Name:                    "channel",
+		Provider:                "openai",
+		PublicModelID:           "public-model",
+		UpstreamBaseURL:         upstream.URL + "/v1",
+		UpstreamAPIKeySecretRef: "env:TEST_UPSTREAM_API_KEY",
+		Status:                  store.StatusEnabled,
+	}); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	t.Setenv("TEST_UPSTREAM_API_KEY", "upstream-secret")
+
+	providerCache := store.NewCache()
+	if _, err := store.ReloadCache(ctx, db, providerCache); err != nil {
+		t.Fatalf("reload provider cache: %v", err)
+	}
+	server := New(config.Config{
+		InstanceID:     "test-router",
+		RequestTimeout: 5 * time.Second,
+		MaxRetries:     0,
+		MaxBodyBytes:   1 << 20,
+	}, db, providerCache, slog.Default())
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{
+		"model":"public-model",
+		"messages":[{"role":"user","content":"hello"}]
+	}`))
+	rec := httptest.NewRecorder()
+	server.Routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if seenAuth != "Bearer upstream-secret" {
+		t.Fatalf("expected provider channel secret ref to supply upstream auth, got %q", seenAuth)
 	}
 }
 

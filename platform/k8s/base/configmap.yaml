@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: relay-runtime-config
+  namespace: aether-relay
+data:
+  CONFIG_SYNC_INTERVAL: "5s"
+  UPSTREAM_TIMEOUT: "60s"
+  UPSTREAM_MAX_RETRIES: "2"
+  MAX_BODY_BYTES: "33554432"
+  RELAY_ACCOUNT_KEY_AUTH: "true"
+  BEST_EFFORT_CLUSTER: "true"
+  ACCOUNT_API_PREFIX: "/account"

@@ -19,6 +19,9 @@ Useful environment variables:
 - `UPSTREAM_MAX_RETRIES`: retry count across providers, default `2`
 - `ROUTER_API_KEY`: optional public API key for `/v1/*`
 - `ROUTER_ADMIN_KEY`: required for `/internal/providers*`
+- `RELAY_ACCOUNT_KEY_AUTH`: set `true` to validate account-issued relay API keys
+- `API_KEY_HASH_SECRET`: HMAC secret used to verify account-issued API keys
+- `ACCOUNT_SERVICE_KEY`: bearer token accepted by the account service
 
 ## Provider Config
 
@@ -92,6 +95,41 @@ Operational routes:
 - `GET /healthz`
 - `GET /readyz`
 - `GET /internal/status`
+
+## Platform Mode
+
+The image now contains three platform entrypoints:
+
+- `/router`: OpenAI-compatible relay and provider-channel admin APIs
+- `/account-service`: account-scoped relay API key lifecycle service
+- `/migrate`: shared platform schema migration entrypoint
+
+`/account-service` exposes:
+
+- `POST /account/api-keys`
+- `GET /account/api-keys`
+- `POST /account/api-keys/{id}/disable`
+- `POST /account/api-keys/{id}/revoke`
+
+Account requests require `Authorization: Bearer $ACCOUNT_SERVICE_KEY` and
+`X-Aether-Account-ID`. Key create responses return the raw `secret` once; list,
+disable, and revoke responses only return safe key metadata.
+
+`/router` exposes platform provider-channel admin routes:
+
+- `GET /internal/provider-channels`
+- `POST /internal/provider-channels`
+- `GET /internal/provider-channels/{id}`
+- `PUT /internal/provider-channels/{id}`
+- `POST /internal/provider-channels/{id}/disable`
+- `DELETE /internal/provider-channels/{id}`
+
+Each provider channel accepts exactly one non-empty public `model_id`. Enabled
+channels are projected into the router provider cache and preserve the existing
+priority/weight selection behavior when multiple channels share a modelId.
+`upstream_api_key_secret_ref` supports `env:NAME` and `file:/path/to/key`; the
+relay resolves the reference into `Provider.APIKey` during cache projection and
+does not expose raw upstream secrets through admin responses.
 
 ## Route Compatibility Matrix
 

@@ -4,7 +4,7 @@ go 1.25
 
 require (
 	github.com/glebarez/sqlite v1.11.0
-	github.com/teilomillet/gollm v0.0.0
+	github.com/teilomillet/gollm v0.0.0-20260321200939-65801e5bcbb5
 	gorm.io/driver/mysql v1.6.0
 	gorm.io/driver/postgres v1.6.0
 	gorm.io/gorm v1.31.1
@@ -41,5 +41,3 @@ require (
 	modernc.org/memory v1.5.0 // indirect
 	modernc.org/sqlite v1.23.1 // indirect
 )
-
-replace github.com/teilomillet/gollm => ../../gollm

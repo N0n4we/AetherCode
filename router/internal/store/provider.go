@@ -17,7 +17,6 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 const (
@@ -118,6 +117,7 @@ func (l *StringList) Scan(value interface{}) error {
 
 type Provider struct {
 	ID                   uint       `json:"id" gorm:"primaryKey"`
+	PlatformChannelID    uint       `json:"platform_channel_id,omitempty" gorm:"-"`
 	Name                 string     `json:"name" gorm:"size:128;index"`
 	Provider             string     `json:"provider" gorm:"size:64;not null;index"`
 	BaseURL              string     `json:"base_url" gorm:"type:text"`
@@ -191,6 +191,7 @@ func (p *Provider) applyDefaults() {
 func (p Provider) Public() PublicProvider {
 	return PublicProvider{
 		ID:                   p.ID,
+		PlatformChannelID:    p.PlatformChannelID,
 		Name:                 p.Name,
 		Provider:             p.Provider,
 		BaseURL:              p.BaseURL,
@@ -213,6 +214,7 @@ func (p Provider) Public() PublicProvider {
 
 type PublicProvider struct {
 	ID                   uint       `json:"id"`
+	PlatformChannelID    uint       `json:"platform_channel_id,omitempty"`
 	Name                 string     `json:"name"`
 	Provider             string     `json:"provider"`
 	BaseURL              string     `json:"base_url"`
@@ -371,11 +373,26 @@ func Open(dsn string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := db.AutoMigrate(&Provider{}, &ConfigVersion{}); err != nil {
+	if err := db.AutoMigrate(
+		&Provider{},
+		&ConfigVersion{},
+		&Account{},
+		&APIKey{},
+		&ProviderChannel{},
+		&PriceConfig{},
+		&UsageEvent{},
+		&BillableCharge{},
+	); err != nil {
 		return nil, err
 	}
 	store := &Store{db: db}
 	if err := store.ensureProviderVersion(context.Background()); err != nil {
+		return nil, err
+	}
+	if err := store.ensureConfigVersion(context.Background(), APIKeyConfigVersionName); err != nil {
+		return nil, err
+	}
+	if err := store.ensureConfigVersion(context.Background(), ProviderChannelConfigVersionName); err != nil {
 		return nil, err
 	}
 	return store, nil
@@ -443,46 +460,15 @@ func (s *Store) DeleteProvider(ctx context.Context, id uint) error {
 }
 
 func (s *Store) ProviderVersion(ctx context.Context) (int64, error) {
-	var version ConfigVersion
-	if err := s.db.WithContext(ctx).First(&version, "name = ?", ProviderConfigVersionName).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			if ensureErr := s.ensureProviderVersion(ctx); ensureErr != nil {
-				return 0, ensureErr
-			}
-			return 1, nil
-		}
-		return 0, err
-	}
-	return version.Version, nil
+	return s.configVersion(ctx, ProviderConfigVersionName)
 }
 
 func (s *Store) ensureProviderVersion(ctx context.Context) error {
-	return s.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&ConfigVersion{
-		Name:    ProviderConfigVersionName,
-		Version: 1,
-	}).Error
+	return s.ensureConfigVersion(ctx, ProviderConfigVersionName)
 }
 
 func bumpProviderVersion(tx *gorm.DB) error {
-	now := time.Now()
-	var version ConfigVersion
-	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&version, "name = ?", ProviderConfigVersionName).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return tx.Create(&ConfigVersion{
-			Name:      ProviderConfigVersionName,
-			Version:   1,
-			UpdatedAt: now,
-		}).Error
-	}
-	if err != nil {
-		return err
-	}
-	return tx.Model(&ConfigVersion{}).
-		Where("name = ?", ProviderConfigVersionName).
-		Updates(map[string]interface{}{
-			"version":    gorm.Expr("version + ?", 1),
-			"updated_at": now,
-		}).Error
+	return bumpConfigVersion(tx, ProviderConfigVersionName)
 }
 
 type Cache struct {
@@ -520,7 +506,7 @@ func ReloadCache(ctx context.Context, db *Store, cache *Cache) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	providers, err := db.Providers(ctx)
+	providers, err := db.RoutingProviders(ctx)
 	if err != nil {
 		return 0, err
 	}

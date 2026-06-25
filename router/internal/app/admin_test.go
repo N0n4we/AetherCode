@@ -122,6 +122,54 @@ func TestAdminProviderCreateListAndStatusExposeCapabilitiesWithoutSecrets(t *tes
 	}
 }
 
+func TestAdminProviderChannelsValidateSingleModelAndProjectToCache(t *testing.T) {
+	server := newAdminTestServer(t)
+
+	invalidReq := httptest.NewRequest(http.MethodPost, "/internal/provider-channels", bytes.NewReader([]byte(`{
+		"name":"invalid",
+		"provider":"openai",
+		"model_id":"gpt-4o,gpt-4o-mini"
+	}`)))
+	invalidReq.Header.Set("Authorization", "Bearer admin-secret")
+	invalidRec := httptest.NewRecorder()
+	server.Routes().ServeHTTP(invalidRec, invalidReq)
+	if invalidRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected invalid multi-model channel to fail, got %d: %s", invalidRec.Code, invalidRec.Body.String())
+	}
+
+	createReq := httptest.NewRequest(http.MethodPost, "/internal/provider-channels", bytes.NewReader([]byte(`{
+		"name":"channel-a",
+		"provider":"openai",
+		"upstream_base_url":"http://upstream/v1",
+		"upstream_model":"deployment-a",
+		"upstream_api_key_secret_ref":"gcp-secret-manager:projects/test/secrets/openai",
+		"model_id":"gpt-4o",
+		"endpoint_capabilities":["openai.chat_completions"],
+		"priority":20,
+		"weight":100
+	}`)))
+	createReq.Header.Set("Authorization", "Bearer admin-secret")
+	createRec := httptest.NewRecorder()
+	server.Routes().ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected channel create 201, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+	if bytes.Contains(createRec.Body.Bytes(), []byte("sk-")) {
+		t.Fatalf("channel response exposed an upstream secret value: %s", createRec.Body.String())
+	}
+
+	selected, err := server.cache.SelectForCapability("gpt-4o", store.EndpointCapabilityOpenAIChatCompletions, nil)
+	if err != nil {
+		t.Fatalf("select projected provider channel: %v", err)
+	}
+	if selected.PlatformChannelID == 0 {
+		t.Fatalf("selected provider did not preserve platform channel attribution: %+v", selected)
+	}
+	if got := selected.UpstreamModel("gpt-4o"); got != "deployment-a" {
+		t.Fatalf("expected upstream model mapping, got %q", got)
+	}
+}
+
 func newAdminTestServer(t *testing.T) *Server {
 	t.Helper()
 	db, err := store.Open("sqlite://" + filepath.Join(t.TempDir(), "router.db"))
