@@ -1,0 +1,26 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - postgres.yaml
+  - configmap.yaml
+  - relay.yaml
+  - account.yaml
+  - serviceaccounts.yaml
+  - service-loadbalancer.yaml
+  - openrouter-seed.yaml
+
+secretGenerator:
+  - name: relay-runtime-secrets
+    namespace: aether-relay
+    envs:
+      - secrets.env
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+images:
+  - name: ghcr.io/aethercode/router
+    newName: ccr.ccs.tencentyun.com/aethercode-100034871923/router
+    newTag: 20260703-183944

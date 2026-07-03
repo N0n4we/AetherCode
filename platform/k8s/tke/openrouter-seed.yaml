@@ -1,0 +1,211 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openrouter-provider-channel-sync
+  namespace: aether-relay
+  labels:
+    app.kubernetes.io/name: openrouter-provider-channel-sync
+data:
+  sync.py: |
+    import json
+    import os
+    import sys
+    import time
+    import urllib.error
+    import urllib.request
+
+    BASE_URL = os.getenv("RELAY_BASE_URL", "http://relay.aether-relay.svc.cluster.local").rstrip("/")
+    ADMIN_KEY = os.environ["ROUTER_ADMIN_KEY"]
+
+    DESIRED_CHANNELS = [
+        {
+            "name": "OpenRouter poolside laguna xs 2.1 free",
+            "provider": "openai",
+            "model_id": "poolside/laguna-xs-2.1:free",
+            "endpoint_capabilities": ["openai.chat_completions", "openai.completions"],
+            "status": 1,
+            "priority": 10,
+            "weight": 100,
+            "upstream_base_url": "https://openrouter.ai/api/v1",
+            "upstream_model": "poolside/laguna-xs-2.1:free",
+            "upstream_api_key_secret_ref": "env:OPENROUTER_API_KEY",
+            "auth_header": "Authorization",
+            "auth_prefix": "",
+            "headers": {},
+            "channel_type": "openrouter",
+            "relay_format": "openai-compatible",
+            "billing_class": "free",
+        },
+        {
+            "name": "OpenRouter cohere north mini code free",
+            "provider": "openai",
+            "model_id": "cohere/north-mini-code:free",
+            "endpoint_capabilities": ["openai.chat_completions", "openai.completions"],
+            "status": 1,
+            "priority": 10,
+            "weight": 100,
+            "upstream_base_url": "https://openrouter.ai/api/v1",
+            "upstream_model": "cohere/north-mini-code:free",
+            "upstream_api_key_secret_ref": "env:OPENROUTER_API_KEY",
+            "auth_header": "Authorization",
+            "auth_prefix": "",
+            "headers": {},
+            "channel_type": "openrouter",
+            "relay_format": "openai-compatible",
+            "billing_class": "free",
+        },
+    ]
+
+    MANAGED_FIELDS = tuple(DESIRED_CHANNELS[0].keys())
+
+    def api(method, path, payload=None):
+        data = None
+        if payload is not None:
+            data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        request = urllib.request.Request(f"{BASE_URL}{path}", data=data, method=method)
+        request.add_header("Authorization", f"Bearer {ADMIN_KEY}")
+        if data is not None:
+            request.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                body = response.read()
+        except urllib.error.HTTPError as err:
+            body = err.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"{method} {path} failed with {err.code}: {body}") from err
+        if not body:
+            return None
+        return json.loads(body.decode("utf-8"))
+
+    def wait_for_relay():
+        deadline = time.monotonic() + 300
+        while time.monotonic() < deadline:
+            try:
+                with urllib.request.urlopen(f"{BASE_URL}/healthz", timeout=5):
+                    return
+            except Exception:
+                time.sleep(5)
+        raise RuntimeError("relay did not become healthy before timeout")
+
+    def managed_view(channel):
+        return {field: channel.get(field) for field in MANAGED_FIELDS}
+
+    def sync_channels():
+        existing_channels = api("GET", "/internal/provider-channels")
+        by_model = {}
+        for channel in existing_channels:
+            by_model.setdefault(channel.get("model_id"), []).append(channel)
+
+        changed = False
+        for desired in DESIRED_CHANNELS:
+            model_id = desired["model_id"]
+            matches = sorted(by_model.get(model_id, []), key=lambda channel: channel["id"])
+            if not matches:
+                created = api("POST", "/internal/provider-channels", desired)
+                changed = True
+                print(f"created provider channel {created['id']} for {model_id}")
+                continue
+
+            current = matches[0]
+            if len(matches) > 1:
+                duplicate_ids = ",".join(str(channel["id"]) for channel in matches[1:])
+                print(f"warning: unmanaged duplicate channels for {model_id}: {duplicate_ids}", file=sys.stderr)
+
+            if managed_view(current) == desired:
+                print(f"provider channel {current['id']} already in sync for {model_id}")
+                continue
+
+            api("PUT", f"/internal/provider-channels/{current['id']}", desired)
+            changed = True
+            print(f"updated provider channel {current['id']} for {model_id}")
+
+        return changed
+
+    def wait_for_cache_sync():
+        for _ in range(24):
+            status = api("GET", "/internal/status")
+            if status.get("in_sync"):
+                print(f"provider cache in sync at version {status['cache']['version']}")
+                return
+            time.sleep(5)
+        raise RuntimeError("provider cache did not sync before timeout")
+
+    wait_for_relay()
+    if sync_channels():
+        wait_for_cache_sync()
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sync-openrouter-provider-channels-once
+  namespace: aether-relay
+  labels:
+    app.kubernetes.io/name: sync-openrouter-provider-channels
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sync-openrouter-provider-channels
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: sync
+          image: python:3.12-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["python", "/scripts/sync.py"]
+          env:
+            - name: ROUTER_ADMIN_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: relay-runtime-secrets
+                  key: router-admin-key
+          volumeMounts:
+            - name: sync-script
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: sync-script
+          configMap:
+            name: openrouter-provider-channel-sync
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: sync-openrouter-provider-channels
+  namespace: aether-relay
+  labels:
+    app.kubernetes.io/name: sync-openrouter-provider-channels
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: sync-openrouter-provider-channels
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: sync
+              image: python:3.12-alpine
+              imagePullPolicy: IfNotPresent
+              command: ["python", "/scripts/sync.py"]
+              env:
+                - name: ROUTER_ADMIN_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: relay-runtime-secrets
+                      key: router-admin-key
+              volumeMounts:
+                - name: sync-script
+                  mountPath: /scripts
+                  readOnly: true
+          volumes:
+            - name: sync-script
+              configMap:
+                name: openrouter-provider-channel-sync

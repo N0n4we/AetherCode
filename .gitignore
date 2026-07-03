@@ -1,0 +1,11 @@
+.terraform/
+.tccli/
+platform/terraform/tencentcloud/.tmp/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+.terraform.tfstate.lock.info
+platform/k8s/tke/secrets.env
+platform/terraform/tencentcloud/aether_tf_node_pool
