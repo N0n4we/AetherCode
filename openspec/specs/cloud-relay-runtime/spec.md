@@ -16,15 +16,19 @@ The platform SHALL define Terraform-managed cloud resources for the relay runtim
 - **THEN** it exposes the non-secret connection references required to deploy Kubernetes workloads and connect them to the database
 
 ### Requirement: Best Effort Kubernetes Cluster
-The platform SHALL run on a best-effort Kubernetes cluster while still defining health, readiness, resource, and rollout controls for service workloads.
+The platform SHALL run on a best-effort Kubernetes cluster while still defining health, readiness, resource, rollout, and parking controls for service workloads and optional UI workloads.
 
 #### Scenario: Workloads declare health behavior
-- **WHEN** relay and account workloads are deployed
-- **THEN** each workload has liveness and readiness checks suitable for Kubernetes rollout and traffic gating
+- **WHEN** relay, account, and optional UI workloads are deployed
+- **THEN** each workload has health behavior suitable for Kubernetes rollout and traffic gating
 
 #### Scenario: Best effort availability is explicit
 - **WHEN** operators inspect the runtime configuration
 - **THEN** the configuration identifies the cluster as best-effort and does not imply a strict high-availability SLO
+
+#### Scenario: Parking preserves restorable state
+- **WHEN** operators park the environment for short-term cost control
+- **THEN** workloads can be scaled down and the Terraform-managed public application CLB can be removed while preserving Terraform state and persistent volumes needed for restoration
 
 ### Requirement: Relay And Account Service Deployment
 The Kubernetes runtime SHALL deploy the relay service and account service as distinct workloads with independently configurable images, replicas, environment, and resource settings.

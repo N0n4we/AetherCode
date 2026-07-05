@@ -37,3 +37,19 @@ output "tke_public_endpoint" {
 output "node_pool_auto_scaling_group_id" {
   value = tencentcloud_kubernetes_node_pool.aether_zero.auto_scaling_group_id
 }
+
+output "app_public_clb_id" {
+  value = tencentcloud_clb_instance.app_public.id
+}
+
+output "app_public_ip" {
+  value = tencentcloud_eip.app_public.public_ip
+}
+
+output "openwebui_public_url" {
+  value = "https://openwebui.n0n4w3.cn"
+}
+
+output "relay_public_base_url" {
+  value = "https://relay.n0n4w3.cn/v1"
+}

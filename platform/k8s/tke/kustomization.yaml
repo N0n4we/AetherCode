@@ -10,12 +10,17 @@ resources:
   - serviceaccounts.yaml
   - service-loadbalancer.yaml
   - openrouter-seed.yaml
+  - openwebui.yaml
 
 secretGenerator:
   - name: relay-runtime-secrets
     namespace: aether-relay
     envs:
       - secrets.env
+  - name: openwebui-secrets
+    namespace: openwebui
+    envs:
+      - openwebui-secrets.env
 
 generatorOptions:
   disableNameSuffixHash: true
@@ -24,3 +29,6 @@ images:
   - name: ghcr.io/aethercode/router
     newName: ccr.ccs.tencentyun.com/aethercode-100034871923/router
     newTag: 20260703-183944
+  - name: ghcr.io/open-webui/open-webui
+    newName: ccr.ccs.tencentyun.com/aethercode-100034871923/open-webui
+    newTag: v0.10.2

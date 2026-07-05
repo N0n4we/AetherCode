@@ -19,5 +19,5 @@ variable "node_pool_max_size" {
 variable "kube_api_allowed_cidrs" {
   description = "CIDR ranges allowed to access the public TKE Kubernetes API endpoint."
   type        = list(string)
-  default     = ["188.253.117.150/32"]
+  default     = ["188.253.117.150/32", "45.137.183.42/32"]
 }

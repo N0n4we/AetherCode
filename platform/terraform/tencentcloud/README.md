@@ -10,6 +10,10 @@ Currently tracked resources:
 - The default security group `sg-bvlotzok` and its IPv4/IPv6 default rule set
 - TKE cluster `cls-26zqizrl` (`aether`)
 - Public TKE Kubernetes API endpoint restricted by `kube_api_allowed_cidrs`
+- A Terraform-managed public EIP-backed application CLB for relay and Open
+  WebUI test access. The Kubernetes Services expose fixed NodePorts; Terraform
+  owns the public application CLB to avoid Tencent Cloud default CLB domain
+  blocking.
 - Zero-size TKE node pool `np-8ldph9uj`
 - SSH key pair `aether_tf_node_pool`
 - `AS_QCSRole` and the Auto Scaling policies required by TKE node pools

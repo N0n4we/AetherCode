@@ -13,4 +13,4 @@ The platform SHALL run on a best-effort Kubernetes cluster while still defining 
 
 #### Scenario: Parking preserves restorable state
 - **WHEN** operators park the environment for short-term cost control
-- **THEN** workloads can be scaled down and public LoadBalancer Services can be removed while preserving Terraform state and persistent volumes needed for restoration
+- **THEN** workloads can be scaled down and the Terraform-managed public application CLB can be removed while preserving Terraform state and persistent volumes needed for restoration

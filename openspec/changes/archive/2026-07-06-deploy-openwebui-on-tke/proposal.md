@@ -6,9 +6,8 @@ need Open WebUI deployed on Tencent Cloud with the same IaC discipline as the
 relay runtime, so the environment can be recreated after parking and tested
 without manual console setup.
 
-This change makes Open WebUI a declared TKE workload that connects to the
-in-cluster relay endpoint instead of depending on public CLB traffic between
-services.
+This change makes Open WebUI a declared TKE workload behind the same
+Terraform-managed application CLB as the relay test endpoint.
 
 ## What Changes
 
@@ -17,17 +16,16 @@ services.
   ConfigMap, Secret references, and persistent storage.
 - Configure Open WebUI to use the relay's in-cluster OpenAI-compatible base URL:
   `http://relay.aether-relay.svc.cluster.local/v1`.
-- Provide an IaC-managed public access option for Open WebUI through a Kubernetes
-  `Service type=LoadBalancer`, while documenting that the resulting CLB is owned
-  by the TKE cloud controller rather than Terraform.
+- Provide an IaC-managed public access option through a Terraform-managed
+  EIP-backed application CLB, with Kubernetes fixed NodePort Services as
+  backends.
 - Extend platform runbooks to cover Open WebUI deployment, parking, restoration,
   and smoke testing.
 - Keep Open WebUI secrets and generated credentials outside the repository.
 
 Out of scope for this change:
 
-- Replacing the current per-Service CLB approach with a shared Ingress or
-  Gateway.
+- Replacing the current shared TCP CLB with L7 Ingress/Gateway routing.
 - Managing the TCR Personal repository through Terraform.
 - Storing Open WebUI admin passwords, OpenRouter keys, or relay API keys in
   version control.

@@ -17,11 +17,10 @@ secrets are intentionally not stored in this repository.
 
 Current public endpoints:
 
-- Relay: `http://lb-74kbv10l-5xczlkyth7osdqr8.clb.sh-tencentclb.com`
-- OpenAI-compatible base URL:
-  `http://lb-74kbv10l-5xczlkyth7osdqr8.clb.sh-tencentclb.com/v1`
-- Account service:
-  `http://lb-l5vk4kbl-i1jarzn7ckm3sf2o.clb.sh-tencentclb.com`
+- Open WebUI: `https://openwebui.n0n4w3.cn`
+- Relay: `https://relay.n0n4w3.cn`
+- OpenAI-compatible base URL: `https://relay.n0n4w3.cn/v1`
+- Account service: internal-only unless a separate public Service/CLB is applied.
 
 Current Tencent Cloud resources managed by Terraform include VPC, subnets, NAT,
 EIP, default route, TKE cluster, node pool, public Kubernetes endpoint,
@@ -33,8 +32,9 @@ Known non-Terraform resources:
   `ccr.ccs.tencentyun.com/aethercode-100034871923/router`. TencentCloud
   Terraform provider coverage is for TCR Enterprise, so the Personal repository
   is documented but not managed by Terraform.
-- CLBs behind `relay-public` and `account-public`. These are created by the TKE
-  cloud controller from Kubernetes `Service type=LoadBalancer`.
+- The application CLB `aether-app-public` and its EIP. Terraform manages the
+  public relay/Open WebUI entrypoint because Tencent Cloud blocks default CLB
+  domains for browser/API use.
 - Kubernetes workloads, Services, Secrets, ConfigMaps, Jobs, and CronJobs. These
   are managed by `platform/k8s/tke`.
 
@@ -59,6 +59,7 @@ Tencent Cloud assumptions:
 Do not commit:
 
 - `platform/k8s/tke/secrets.env`
+- `platform/k8s/tke/openwebui-secrets.env`
 - generated relay API keys
 - OpenRouter keys
 - kubeconfig files
@@ -174,6 +175,24 @@ account-service-key=<bearer-key-for-account-service>
 openrouter-api-key=<openrouter-key>
 ```
 
+Create the local Open WebUI secret file:
+
+```sh
+cd /Users/noname/Desktop/Projects/AetherCode
+cp platform/k8s/tke/openwebui-secrets.env.example \
+   platform/k8s/tke/openwebui-secrets.env
+```
+
+Fill these values:
+
+```text
+openwebui-relay-api-key=<relay-api-key-from-account-service>
+webui-secret-key=<random-session-signing-secret>
+```
+
+`openwebui-relay-api-key` is a relay API key created via the account service
+(see section 9). Generate `webui-secret-key` with `openssl rand -base64 32`.
+
 Use the raw password for `postgres-password`. URL-encode the same password in
 `sql-dsn`, especially if it contains `/`, `+`, `=`, `%`, `@`, or other reserved
 characters.
@@ -269,12 +288,14 @@ kubectl -n aether-relay wait \
   --for=condition=complete \
   job/sync-openrouter-provider-channels-once \
   --timeout=300s
+kubectl -n openwebui rollout status deployment/openwebui --timeout=300s
 ```
 
 Check Services:
 
-```sh
 kubectl -n aether-relay get svc relay-public account-public
+kubectl -n openwebui get svc openwebui openwebui-public
+kubectl -n openwebui get pvc openwebui-data
 ```
 
 Runtime resources created by the overlay:
@@ -283,10 +304,15 @@ Runtime resources created by the overlay:
 - Postgres StatefulSet and Service
 - Relay Deployment and Service
 - Account Deployment and Service
-- Public Tencent Cloud LoadBalancer Services
+- Public NodePort Services (`relay-public`, `openwebui`, `openwebui-public`) used
+  as Terraform CLB backends
 - Runtime ConfigMap
 - Runtime Secret generated from `secrets.env`
 - OpenRouter provider-channel sync ConfigMap, one-shot Job, and CronJob
+- Namespace `openwebui`
+- Open WebUI Deployment, NodePort Services, and Terraform CLB backend wiring
+- Open WebUI ConfigMap and Secret generated from `openwebui-secrets.env`
+- Open WebUI PVC `openwebui-data` mounted at `/app/backend/data`
 
 ## 7. OpenRouter Provider Channel Drift Sync
 
@@ -333,28 +359,28 @@ kubectl -n aether-relay get cronjob sync-openrouter-provider-channels
 
 ## 8. Verify Health
 
-Get current public endpoints from Kubernetes:
+Get current public endpoints from Terraform:
 
 ```sh
-kubectl -n aether-relay get svc relay-public account-public
+terraform -chdir=platform/terraform/tencentcloud output openwebui_public_url
+terraform -chdir=platform/terraform/tencentcloud output relay_public_base_url
 ```
 
 Health checks:
 
 ```sh
-RELAY_URL="http://lb-74kbv10l-5xczlkyth7osdqr8.clb.sh-tencentclb.com"
-ACCOUNT_URL="http://lb-l5vk4kbl-i1jarzn7ckm3sf2o.clb.sh-tencentclb.com"
+APP_URL="https://openwebui.n0n4w3.cn"
+RELAY_BASE_URL="https://relay.n0n4w3.cn/v1"
 
-curl --noproxy '*' -fsS "$RELAY_URL/healthz"
-curl --noproxy '*' -fsS "$ACCOUNT_URL/healthz"
+curl --noproxy '*' -fsS "$APP_URL/health"
+curl --noproxy '*' -fsS "https://relay.n0n4w3.cn/healthz"
 ```
 
-If local DNS returns a fake IP, resolve the CLB domain explicitly:
+If local DNS or proxy settings interfere, bypass proxies and test the raw EIP:
 
 ```sh
-curl --noproxy '*' \
-  --resolve "lb-74kbv10l-5xczlkyth7osdqr8.clb.sh-tencentclb.com:80:1.15.197.38" \
-  -fsS "$RELAY_URL/healthz"
+curl --noproxy '*' -fsS "http://110.40.156.154/health"
+curl --noproxy '*' -fsS "http://110.40.156.154:8080/healthz"
 ```
 
 Check internal relay status:
@@ -415,7 +441,7 @@ curl --noproxy '*' -fsS \
 Use the relay public endpoint:
 
 ```sh
-RELAY_URL="http://lb-74kbv10l-5xczlkyth7osdqr8.clb.sh-tencentclb.com"
+RELAY_URL="https://relay.n0n4w3.cn"
 
 curl --noproxy '*' -fsS \
   "$RELAY_URL/v1/chat/completions" \
@@ -448,6 +474,49 @@ Provider metadata headers should include:
 - `X-Aether-Provider-Name`
 - `X-Aether-Provider-Version`
 - `X-Aether-Router-Instance`
+
+## 10.1 Open WebUI Smoke Test
+
+After Open WebUI is rolled out, confirm it can reach the relay through the
+in-cluster Service and serve a chat request from a relay-backed model.
+
+Get the public Open WebUI URL:
+
+```sh
+OPENWEBUI_URL="http://$(kubectl -n openwebui get svc openwebui-public \
+  -o jsonpath='{.status.loadBalancer.ingress[0].ip}')"
+```
+
+Check Open WebUI health:
+
+```sh
+curl --noproxy '*' -fsS "$OPENWEBUI_URL/health"
+```
+
+Confirm Open WebUI lists relay-backed models (sign in as the bootstrapped admin,
+then open Settings -> Connections or use the `/api/models` endpoint with an Open
+WebUI session token). Expected relay-backed models include:
+
+- `poolside/laguna-xs-2.1:free`
+- `cohere/north-mini-code:free`
+
+Submit a chat request through the Open WebUI UI using one of the relay-backed
+models and confirm a response is returned. The request flows:
+
+```text
+Browser -> openwebui-public CLB -> openwebui Service -> Open WebUI pod
+        -> relay.aether-relay.svc.cluster.local/v1 -> OpenRouter
+```
+
+If model listing or chat fails, verify:
+
+- `openwebui-secrets` contains a valid `openwebui-relay-api-key`.
+- `relay` Deployment in `aether-relay` is healthy and `/internal/status`
+  reports `in_sync: true`.
+- Open WebUI pod env includes
+  `OPENAI_API_BASE_URL=http://relay.aether-relay.svc.cluster.local/v1`
+  (check with `kubectl -n openwebui exec deployment/openwebui -- env | grep
+  OPENAI_API_BASE_URL`).
 
 ## 11. Troubleshooting
 
@@ -545,13 +614,14 @@ Update image tag in `platform/k8s/tke/kustomization.yaml`, then:
 kubectl apply -k platform/k8s/tke
 kubectl -n aether-relay rollout status deployment/relay --timeout=300s
 kubectl -n aether-relay rollout status deployment/account --timeout=300s
+kubectl -n openwebui rollout status deployment/openwebui --timeout=300s
 ```
 
 Rollback to the previous Deployment revision:
 
-```sh
 kubectl -n aether-relay rollout undo deployment/relay
 kubectl -n aether-relay rollout undo deployment/account
+kubectl -n openwebui rollout undo deployment/openwebui
 ```
 
 Or roll back by restoring the previous `newTag` in
@@ -578,6 +648,21 @@ with care:
 - `API_KEY_HASH_SECRET` affects validation of generated relay API keys. Rotating
   it invalidates existing API key hashes unless keys are reissued.
 
+Rotate Open WebUI relay API key or `WEBUI_SECRET_KEY`:
+
+1. Update `openwebui-relay-api-key` or `webui-secret-key` in local
+   `platform/k8s/tke/openwebui-secrets.env`.
+2. Run `kubectl apply -k platform/k8s/tke`.
+3. Restart Open WebUI so env vars reload. `ENABLE_PERSISTENT_CONFIG=False` means
+   the new relay endpoint/key takes effect on restart without UI admin changes:
+
+```sh
+kubectl -n openwebui rollout restart deployment/openwebui
+kubectl -n openwebui rollout status deployment/openwebui --timeout=300s
+```
+
+Note: rotating `WEBUI_SECRET_KEY` invalidates existing Open WebUI sessions.
+
 ## 14. Parking Or Restoring Capacity
 
 To park the TKE node pool:
@@ -603,6 +688,36 @@ Verify:
 ```sh
 kubectl get nodes
 kubectl -n aether-relay get pods -o wide
+kubectl -n openwebui get pods -o wide
+kubectl -n openwebui get pvc openwebui-data
+```
+
+To park Open WebUI without removing its data, scale the Deployment to zero and
+delete the public Service to release its CLB. The PVC remains:
+
+```sh
+kubectl -n openwebui scale deployment/openwebui --replicas=0
+kubectl -n openwebui delete svc openwebui-public
+kubectl -n openwebui get pvc openwebui-data
+```
+
+To restore Open WebUI after parking, reapply the overlay (which recreates the
+public Service and scales the Deployment back to one replica) and wait for
+rollout:
+
+```sh
+kubectl apply -k platform/k8s/tke
+kubectl -n openwebui rollout status deployment/openwebui --timeout=300s
+kubectl -n openwebui get svc openwebui-public
+```
+
+To fully reset Open WebUI (e.g. wipe accounts, settings, and chat history),
+delete the PVC after scaling down. This is destructive:
+
+```sh
+kubectl -n openwebui scale deployment/openwebui --replicas=0
+kubectl -n openwebui delete pvc openwebui-data
+kubectl apply -k platform/k8s/tke
 ```
 
 ## 15. Final Verification Checklist
@@ -612,10 +727,15 @@ Before considering the deployment healthy:
 - `terraform plan -detailed-exitcode` returns `0`.
 - `kubectl -n aether-relay get pods` shows Postgres, relay, and account pods
   running.
-- `relay-public` and `account-public` have public CLB hostnames.
+- `kubectl -n openwebui get pods` shows the Open WebUI pod running.
+- `kubectl -n openwebui get pvc openwebui-data` shows the PVC bound.
+- `relay-public`, `account-public`, and `openwebui-public` have public CLB
+  hostnames.
 - `GET /healthz` succeeds for relay and account public URLs.
 - `sync-openrouter-provider-channels-once` completed.
 - `sync-openrouter-provider-channels` CronJob exists and is not suspended.
+- Open WebUI can list relay-backed models and complete a chat request through
+  the public Open WebUI URL using a relay-backed model.
 - `/internal/status` reports `in_sync: true`.
 - A generated relay API key can call `/v1/chat/completions`.
 - Temporary smoke-test API keys are disabled or revoked after use.

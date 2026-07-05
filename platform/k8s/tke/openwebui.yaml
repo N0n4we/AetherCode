@@ -1,0 +1,158 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openwebui
+  labels:
+    app.kubernetes.io/name: openwebui
+    aethercode.io/availability: best-effort
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openwebui-config
+  namespace: openwebui
+  labels:
+    app.kubernetes.io/name: openwebui
+data:
+  # IaC-first OpenAI-compatible backend: point at the Terraform-managed relay
+  # public CLB so browser and UI runtime exercise the same public relay entrypoint.
+  ENABLE_OPENAI_API: "True"
+  OPENAI_API_BASE_URL: "https://relay.n0n4w3.cn/v1"
+  # Disable PersistentConfig so manifest/Secret values remain the source of
+  # truth on every restart. Otherwise Open WebUI may keep stale relay endpoint
+  # or key values from its internal database after the first startup.
+  ENABLE_PERSISTENT_CONFIG: "False"
+  # Avoid startup-time Hugging Face model downloads in the TKE runtime. Open
+  # WebUI is used here as a relay-backed chat UI, not as a local RAG runtime.
+  BYPASS_EMBEDDING_AND_RETRIEVAL: "True"
+  RAG_EMBEDDING_MODEL_AUTO_UPDATE: "False"
+  OFFLINE_MODE: "True"
+  HF_HUB_OFFLINE: "1"
+  # Mark the runtime as best-effort, matching the relay platform boundary.
+  BEST_EFFORT_CLUSTER: "true"
+  WEBUI_AUTH: "True"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: openwebui-data
+  namespace: openwebui
+  labels:
+    app.kubernetes.io/name: openwebui
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openwebui
+  namespace: openwebui
+  labels:
+    app.kubernetes.io/name: openwebui
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: openwebui
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: openwebui
+    spec:
+      containers:
+        - name: openwebui
+          # Floating tag is pinned by the kustomization `images` block so the
+          # rendered overlay always uses a concrete release tag.
+          image: ghcr.io/open-webui/open-webui:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: openwebui-config
+          env:
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openwebui-secrets
+                  key: openwebui-relay-api-key
+            - name: WEBUI_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openwebui-secrets
+                  key: webui-secret-key
+          ports:
+            - name: http
+              containerPort: 8080
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 120
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /app/backend/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: openwebui-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openwebui
+  namespace: openwebui
+  labels:
+    app.kubernetes.io/name: openwebui
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: openwebui
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openwebui-public
+  namespace: openwebui
+  labels:
+    app.kubernetes.io/name: openwebui
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: openwebui
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      nodePort: 31327

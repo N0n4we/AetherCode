@@ -3,12 +3,12 @@
 AetherCode currently runs an OpenAI-compatible relay platform on Tencent Cloud
 TKE. Terraform owns the cloud substrate under `platform/terraform/tencentcloud`;
 Kubernetes manifests under `platform/k8s/tke` own in-cluster workloads and
-`Service type=LoadBalancer` business entrypoints.
+fixed NodePort backends. Terraform owns the EIP-backed application CLB used for
+public test access.
 
-The relay runtime is currently parked: node pool maximum size is set to `0`,
-relay/account/postgres workloads are scaled to `0`, and the public relay/account
-LoadBalancer Services were deleted. The platform remains restorable from the
-existing Terraform state and Kubernetes manifests.
+The relay runtime is restorable from Terraform state and Kubernetes manifests.
+Public test access is provided through a Terraform-managed application CLB that
+forwards to fixed Kubernetes NodePorts.
 
 Open WebUI should be deployed as a browser UI for the relay. It should call the
 relay through the in-cluster OpenAI-compatible endpoint:
@@ -30,10 +30,11 @@ environment unless persistent config is disabled.
 **Goals:**
 
 - Add IaC-managed Kubernetes resources for Open WebUI on TKE.
-- Keep the existing ownership boundary: Terraform for Tencent Cloud substrate,
-  Kubernetes manifests for workloads and cloud-controller-created CLBs.
-- Configure Open WebUI to call the relay through the cluster-internal Service
-  URL.
+- Keep a clean ownership boundary: Terraform for Tencent Cloud substrate and
+  the public application CLB; Kubernetes manifests for workloads and NodePort
+  backends.
+- Configure Open WebUI to call the relay through the declared OpenAI-compatible
+  base URL used by the public test path.
 - Provide persistent Open WebUI state so accounts, settings, and chat history
   survive pod restarts and parking.
 - Provide a simple public access path for test usage.
@@ -41,8 +42,7 @@ environment unless persistent config is disabled.
 
 **Non-Goals:**
 
-- Replace the current `Service type=LoadBalancer` approach with shared
-  Ingress/Gateway routing.
+- Replace the shared TCP application CLB with L7 Ingress/Gateway routing.
 - Integrate SSO/OAuth, external identity providers, or production-grade user
   lifecycle management.
 - Migrate Open WebUI to an external PostgreSQL database.
@@ -68,7 +68,7 @@ Open WebUI will run in a dedicated namespace, `openwebui`, with its own
 Deployment, Service, PVC, ConfigMap, and Secret.
 
 This keeps UI lifecycle and data separate from `aether-relay` while still
-allowing stable cluster DNS access to `relay.aether-relay.svc.cluster.local`.
+allowing explicit relay endpoint configuration.
 
 Alternative considered: place Open WebUI in `aether-relay`. Rejected because
 the UI has different data, access, and parking concerns than the relay control
@@ -102,12 +102,12 @@ OPENAI_API_BASE_URL=http://relay.aether-relay.svc.cluster.local/v1
 OPENAI_API_KEY=<relay API key from Kubernetes Secret>
 ```
 
-Using the cluster-internal relay URL avoids public CLB hairpinning and keeps UI
-to relay traffic inside TKE networking.
+Using the shared application CLB URL exercises the same relay endpoint that
+browser/API clients use, which matches the requested domain-mapping workflow.
 
-Alternative considered: configure the public relay CLB URL. Rejected for the
-default path because the relay public LoadBalancer may be deleted during
-parking, while the internal Service is recreated by the overlay.
+Alternative considered: configure the cluster-internal relay Service URL. That
+keeps UI-to-relay traffic inside TKE, but it does not validate the public relay
+listener that Open WebUI users need during this test deployment.
 
 ### Treat Open WebUI PersistentConfig Explicitly
 
@@ -124,14 +124,15 @@ For an IaC-first test environment, prefer `ENABLE_PERSISTENT_CONFIG=False`.
 This makes relay endpoint and key rotation predictable from manifests and
 Secrets, at the cost of not persisting admin UI changes to those settings.
 
-### Public Access Via A Kubernetes LoadBalancer Service
+### Public Access Via Terraform Application CLB
 
-For immediate test access, Open WebUI will expose a public
-`Service type=LoadBalancer`. The resulting Tencent CLB will be owned by the TKE
-cloud controller, not Terraform, matching the relay/account service pattern.
+For immediate test access, Open WebUI and relay are exposed through a single
+Terraform-managed EIP-backed application CLB. Kubernetes provides fixed NodePort
+Services as CLB backends: Open WebUI on `31327` and relay on `31326`.
 
-Alternative considered: shared Ingress/Gateway. Good future direction, but out
-of scope for this change.
+Alternative considered: shared Ingress/Gateway. Good future direction once a
+production domain/certificate strategy is selected, but out of scope for this
+change.
 
 ### Secrets Stay Out Of Git
 
@@ -144,14 +145,14 @@ Kubernetes Secret. The repository will only include examples/placeholders.
 - Open WebUI PersistentConfig may ignore changed environment variables after
   first startup -> Set `ENABLE_PERSISTENT_CONFIG=False` for IaC-first behavior
   or document the manual update/reset path.
-- A public LoadBalancer creates another Tencent CLB -> Accept for the first
-  implementation; track shared Ingress/Gateway as a later optimization.
+- A public entrypoint creates Tencent CLB/EIP cost -> use one shared
+  Terraform-managed application CLB instead of per-Service default CLBs.
 - Open WebUI default SQLite storage is single-pod oriented -> Run one replica by
   default and avoid multi-replica deployment unless an external database design
   is added.
-- Parking deletes public LoadBalancer Services -> Restore with
-  `kubectl apply -k platform/k8s/tke` and wait for the new Open WebUI CLB
-  hostname.
+- Parking removes public access -> scale/delete workloads and remove the
+  Terraform application CLB while keeping PVC data and declarative manifests for
+  restoration.
 - Relay API key rotation can break Open WebUI -> Store the key in a Secret and
   restart Open WebUI after rotation.
 
@@ -172,10 +173,19 @@ Rollback:
 3. Keep the PVC if data should be preserved; delete the PVC only when a full
    reset is intended.
 
-## Open Questions
+## Resolved Open Questions
 
-- Which Open WebUI release tag should be pinned for the initial deployment?
-- Should Open WebUI be reachable publicly, or only through port-forward/Tailscale
-  during testing?
-- Should the implementation add an automated account-service call to create the
-  relay API key, or require the operator to provide it in `secrets.env`?
+The following decisions were made during implementation:
+
+- **Pinned image tag:** `ghcr.io/open-webui/open-webui:v0.10.2` (latest stable
+  release as of 2026-07-05). Pinned in `platform/k8s/tke/openwebui.yaml` and
+  overridable through the `images` block in `kustomization.yaml`.
+- **Public access default:** enabled by default through the shared
+  Terraform-managed application CLB. `openwebui-public` is a fixed NodePort
+  backend, not a Tencent Cloud default-domain CLB.
+- **Relay API key provisioning:** operator-provided in
+  `platform/k8s/tke/secrets.env` (key `openwebui-relay-api-key`). The overlay
+  does not add an automated account-service call to generate the key; the
+  operator creates the relay API key via the account service (see RUNBOOK
+  section 9) and places it in `secrets.env`. This keeps the overlay simple and
+  avoids a key-generation Job with secret material handling.

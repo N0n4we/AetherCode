@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Define the Open WebUI runtime capability on the Tencent Cloud TKE platform: an IaC-managed Kubernetes workload backed by the in-cluster relay, with persistent state, optional public test access, secret hygiene, and operational verification.
+
+## Requirements
 
 ### Requirement: Open WebUI Kubernetes Deployment
 The platform SHALL define an IaC-managed Open WebUI Kubernetes workload for the
@@ -45,23 +49,22 @@ OpenAI-compatible backend.
 - **THEN** it uses an API key sourced from a Kubernetes Secret rather than a
   repository-tracked value
 
-#### Scenario: Open WebUI can reach relay without public CLB
-- **WHEN** relay is running inside the cluster and no relay public LoadBalancer
-  Service exists
-- **THEN** Open WebUI can still send OpenAI-compatible traffic to the relay
-  through the cluster-internal Service
+#### Scenario: Open WebUI can reach relay through the declared relay endpoint
+- **WHEN** relay is running and the relay endpoint is configured in Open WebUI
+- **THEN** Open WebUI can send OpenAI-compatible traffic to the relay through
+  the configured base URL
 
 ### Requirement: Open WebUI Public Test Access
 The platform SHALL provide an IaC-managed public test entrypoint for Open WebUI
 when public access is enabled.
 
 #### Scenario: Public service creates TKE-managed CLB
-- **WHEN** the Open WebUI public Service is applied
-- **THEN** it is a Kubernetes `Service type=LoadBalancer` and the resulting
-  Tencent CLB is owned by the TKE cloud controller
+- **WHEN** the Open WebUI public Service and Terraform public CLB are applied
+- **THEN** Open WebUI is reachable through the Terraform-managed application CLB
+  with a fixed Kubernetes NodePort backend
 
-#### Scenario: Public service deletion releases public entrypoint
-- **WHEN** operators delete the Open WebUI public Service during parking
+#### Scenario: Public entrypoint deletion releases public access
+- **WHEN** operators remove the Terraform application CLB during parking
 - **THEN** the public entrypoint is removed without deleting Open WebUI
   persistent data
 
