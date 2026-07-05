@@ -21,6 +21,7 @@ type relayUsageRecord struct {
 	UpstreamStatus     int
 	CacheState         string
 	ErrorCode          string
+	Usage              relayUsage
 }
 
 func (s *Server) recordRelayUsage(r *http.Request, record relayUsageRecord) {
@@ -65,6 +66,10 @@ func (s *Server) recordRelayUsage(r *http.Request, record relayUsageRecord) {
 		Outcome:            outcome,
 		StatusCode:         record.StatusCode,
 		UpstreamStatus:     record.UpstreamStatus,
+		InputUnits:         record.Usage.InputUnits,
+		CachedInputUnits:   record.Usage.CachedInputUnits,
+		OutputUnits:        record.Usage.OutputUnits,
+		TotalUnits:         record.Usage.TotalUnits,
 		BillableUnits:      1,
 		ErrorCode:          record.ErrorCode,
 		StartedAt:          startedAt,
