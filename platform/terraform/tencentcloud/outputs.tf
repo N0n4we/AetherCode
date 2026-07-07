@@ -30,10 +30,6 @@ output "tke_node_pool_id" {
   value = tencentcloud_kubernetes_node_pool.aether_zero.id
 }
 
-output "tke_public_endpoint" {
-  value = tencentcloud_kubernetes_cluster_endpoint.aether_public.cluster_external_endpoint
-}
-
 output "node_pool_auto_scaling_group_id" {
   value = tencentcloud_kubernetes_node_pool.aether_zero.auto_scaling_group_id
 }

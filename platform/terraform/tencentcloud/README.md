@@ -8,12 +8,12 @@ Currently tracked resources:
   `ap-shanghai-5` Pod ENI subnet required by nodes in that zone
 - NAT Gateway, EIP, and default route for private node outbound internet access
 - The default security group `sg-bvlotzok` and its IPv4/IPv6 default rule set
-- TKE cluster `cls-26zqizrl` (`aether`)
-- Public TKE Kubernetes API endpoint restricted by `kube_api_allowed_cidrs`
+- TKE cluster `cls-26zqizrl` (`aether`) with no public Kubernetes API
+  endpoint managed by Terraform
 - A Terraform-managed public EIP-backed application CLB for relay and Open
   WebUI test access. The Kubernetes Services expose fixed NodePorts; Terraform
-  owns the public application CLB to avoid Tencent Cloud default CLB domain
-  blocking.
+  owns the shared HTTPS application CLB to avoid Tencent Cloud default CLB
+  domain blocking.
 - Zero-size TKE node pool `np-8ldph9uj`
 - SSH key pair `aether_tf_node_pool`
 - `AS_QCSRole` and the Auto Scaling policies required by TKE node pools

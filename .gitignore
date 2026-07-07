@@ -7,6 +7,7 @@ platform/terraform/tencentcloud/.tmp/
 crash.log
 crash.*.log
 .terraform.tfstate.lock.info
+.resource-control/
 platform/k8s/tke/secrets.env
 platform/k8s/tke/openwebui-secrets.env
 platform/terraform/tencentcloud/aether_tf_node_pool

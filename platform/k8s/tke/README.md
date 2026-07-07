@@ -88,7 +88,8 @@ kubectl -n openwebui get pvc openwebui-data
 
 `openwebui-public` is a fixed `NodePort` Service used as the Kubernetes backend
 for the Terraform-managed application CLB. The shared public CLB exposes Open
-WebUI on port `80` and relay on port `8080`.
+WebUI on `https://openwebui.n0n4w3.cn` and relay on
+`https://relay.n0n4w3.cn`.
 
 Open WebUI is configured with:
 
