@@ -8,7 +8,6 @@ resources:
   - relay.yaml
   - account.yaml
   - serviceaccounts.yaml
-  - service-loadbalancer.yaml
   - openrouter-seed.yaml
   - openwebui.yaml
 
