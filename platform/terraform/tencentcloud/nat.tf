@@ -2,7 +2,7 @@ resource "tencentcloud_eip" "aether_nat" {
   name                       = "aether-nat"
   type                       = "EIP"
   internet_charge_type       = "TRAFFIC_POSTPAID_BY_HOUR"
-  internet_max_bandwidth_out = 20
+  internet_max_bandwidth_out = 1
 
   tags = {}
 }
