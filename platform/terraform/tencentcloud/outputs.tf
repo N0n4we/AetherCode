@@ -18,10 +18,6 @@ output "node_security_group_id" {
   value = tencentcloud_security_group.default.id
 }
 
-output "nat_gateway_id" {
-  value = tencentcloud_nat_gateway.aether.id
-}
-
 output "tke_cluster_id" {
   value = tencentcloud_kubernetes_cluster.aether.id
 }
