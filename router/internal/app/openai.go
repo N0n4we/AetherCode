@@ -55,6 +55,7 @@ type responseCommitTracker struct {
 type trackedResponseBodyWriter struct {
 	w       http.ResponseWriter
 	tracker *responseCommitTracker
+	sink    io.Writer
 }
 
 type openAICompatibleValidationError struct {
@@ -205,7 +206,9 @@ func (s *Server) relayOpenAICompatible(w http.ResponseWriter, r *http.Request, e
 
 		setOpenAIProviderHeaders(w, selected, s.cfg.InstanceID)
 		tracker := &responseCommitTracker{}
-		if err := copyUpstreamResponse(w, result.response, tracker); err != nil {
+		capture := newUsageCapture()
+		contentType := result.response.Header.Get("Content-Type")
+		if err := copyUpstreamResponse(w, result.response, tracker, capture); err != nil {
 			s.logger.Warn("copy upstream response failed", "provider_id", selected.provider.ID, "committed", tracker.Committed(), "error", err)
 		}
 		statusCode := tracker.statusCode
@@ -216,6 +219,7 @@ func (s *Server) relayOpenAICompatible(w http.ResponseWriter, r *http.Request, e
 		if statusCode >= 400 {
 			outcome = store.UsageOutcomeFailed
 		}
+		usage := capture.usage(contentType)
 		s.recordRelayUsage(r, relayUsageRecord{
 			StartedAt:          startedAt,
 			CompletedAt:        time.Now(),
@@ -226,6 +230,7 @@ func (s *Server) relayOpenAICompatible(w http.ResponseWriter, r *http.Request, e
 			StatusCode:         statusCode,
 			UpstreamStatus:     result.response.StatusCode,
 			CacheState:         cacheStateFromResponse(result.response),
+			Usage:              usage,
 		})
 		return
 	}
@@ -350,14 +355,14 @@ func shouldRetry(status int) bool {
 	return status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
 }
 
-func copyUpstreamResponse(w http.ResponseWriter, resp *http.Response, tracker *responseCommitTracker) error {
+func copyUpstreamResponse(w http.ResponseWriter, resp *http.Response, tracker *responseCommitTracker, sink io.Writer) error {
 	defer resp.Body.Close()
 	copyHeaders(w.Header(), resp.Header)
 	tracker.WriteHeader(w, resp.StatusCode)
 
 	flusher, canFlush := w.(http.Flusher)
 	if !canFlush {
-		_, err := io.Copy(trackedResponseBodyWriter{w: w, tracker: tracker}, resp.Body)
+		_, err := io.Copy(trackedResponseBodyWriter{w: w, tracker: tracker, sink: sink}, resp.Body)
 		return err
 	}
 
@@ -367,6 +372,9 @@ func copyUpstreamResponse(w http.ResponseWriter, resp *http.Response, tracker *r
 		if n > 0 {
 			if _, writeErr := tracker.Write(w, buf[:n]); writeErr != nil {
 				return writeErr
+			}
+			if sink != nil {
+				_, _ = sink.Write(buf[:n])
 			}
 			flusher.Flush()
 		}
@@ -404,7 +412,11 @@ func (t *responseCommitTracker) Committed() bool {
 }
 
 func (w trackedResponseBodyWriter) Write(data []byte) (int, error) {
-	return w.tracker.Write(w.w, data)
+	n, err := w.tracker.Write(w.w, data)
+	if n > 0 && w.sink != nil {
+		_, _ = w.sink.Write(data[:n])
+	}
+	return n, err
 }
 
 func copyHeaders(dst http.Header, src http.Header) {

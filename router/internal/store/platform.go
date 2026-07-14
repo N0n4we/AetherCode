@@ -714,17 +714,75 @@ func (s *Store) ImportLegacyProvidersAsChannels(ctx context.Context) (int, error
 }
 
 type PriceConfig struct {
-	ID                uint      `json:"id" gorm:"primaryKey"`
-	AccountID         *uint     `json:"account_id" gorm:"index"`
-	PublicModelID     string    `json:"model_id" gorm:"size:128;index"`
-	ProviderChannelID *uint     `json:"provider_channel_id" gorm:"index"`
-	UsageClass        string    `json:"usage_class" gorm:"size:64;not null;index"`
-	CacheState        string    `json:"cache_state" gorm:"size:64;not null;index"`
-	Currency          string    `json:"currency" gorm:"size:16;not null;default:'USD'"`
-	UnitPriceMicros   int64     `json:"unit_price_micros" gorm:"not null"`
-	EffectiveAt       time.Time `json:"effective_at" gorm:"not null;index"`
-	CreatedAt         time.Time `json:"created_at"`
-	UpdatedAt         time.Time `json:"updated_at"`
+	ID                uint   `json:"id" gorm:"primaryKey"`
+	AccountID         *uint  `json:"account_id" gorm:"index"`
+	PublicModelID     string `json:"model_id" gorm:"size:128;index"`
+	ProviderChannelID *uint  `json:"provider_channel_id" gorm:"index"`
+	UsageClass        string `json:"usage_class" gorm:"size:64;not null;index"`
+	CacheState        string `json:"cache_state" gorm:"size:64;not null;index"`
+	Currency          string `json:"currency" gorm:"size:16;not null;default:'USD'"`
+	// UnitPriceMicros is the per-request base fee applied for each billable
+	// request unit. It is retained for backward compatibility and for models
+	// billed on a flat per-request basis.
+	UnitPriceMicros int64 `json:"unit_price_micros" gorm:"not null"`
+	// InputUnitPriceMicros is the price charged per non-cached input (prompt)
+	// token reported by the upstream response.
+	InputUnitPriceMicros int64 `json:"input_unit_price_micros" gorm:"not null;default:0"`
+	// OutputUnitPriceMicros is the price charged per output (completion) token
+	// reported by the upstream response.
+	OutputUnitPriceMicros int64 `json:"output_unit_price_micros" gorm:"not null;default:0"`
+	// CachedInputUnitPriceMicros is the price charged per cached input token.
+	// When unset it falls back to InputUnitPriceMicros so cached tokens are
+	// never silently free unless explicitly configured.
+	CachedInputUnitPriceMicros int64     `json:"cached_input_unit_price_micros" gorm:"not null;default:0"`
+	EffectiveAt                time.Time `json:"effective_at" gorm:"not null;index"`
+	CreatedAt                  time.Time `json:"created_at"`
+	UpdatedAt                  time.Time `json:"updated_at"`
+}
+
+// AmountMicros computes the dynamic billable amount for a usage event using
+// the actual request cost captured on the event. The total combines the flat
+// per-request base fee with token-based charges so pricing reflects the real
+// input, cached-input, and output token counts reported by the selected
+// channel's upstream response.
+func (p PriceConfig) AmountMicros(event *UsageEvent) int64 {
+	if event == nil {
+		return 0
+	}
+
+	billableUnits := event.BillableUnits
+	if billableUnits <= 0 {
+		billableUnits = 1
+	}
+	amount := p.UnitPriceMicros * billableUnits
+
+	inputUnits := event.InputUnits
+	if inputUnits < 0 {
+		inputUnits = 0
+	}
+	cachedUnits := event.CachedInputUnits
+	if cachedUnits < 0 {
+		cachedUnits = 0
+	}
+	if cachedUnits > inputUnits {
+		cachedUnits = inputUnits
+	}
+	regularInput := inputUnits - cachedUnits
+
+	cachedRate := p.CachedInputUnitPriceMicros
+	if cachedRate == 0 {
+		cachedRate = p.InputUnitPriceMicros
+	}
+
+	outputUnits := event.OutputUnits
+	if outputUnits < 0 {
+		outputUnits = 0
+	}
+
+	amount += p.InputUnitPriceMicros * regularInput
+	amount += cachedRate * cachedUnits
+	amount += p.OutputUnitPriceMicros * outputUnits
+	return amount
 }
 
 func (PriceConfig) TableName() string {
@@ -776,7 +834,9 @@ type UsageEvent struct {
 	StatusCode         int       `json:"status_code"`
 	UpstreamStatus     int       `json:"upstream_status"`
 	InputUnits         int64     `json:"input_units"`
+	CachedInputUnits   int64     `json:"cached_input_units"`
 	OutputUnits        int64     `json:"output_units"`
+	TotalUnits         int64     `json:"total_units"`
 	BillableUnits      int64     `json:"billable_units"`
 	ErrorCode          string    `json:"error_code" gorm:"size:128"`
 	StartedAt          time.Time `json:"started_at"`
@@ -814,6 +874,21 @@ func (e *UsageEvent) applyDefaults() {
 	if e.BillableUnits == 0 {
 		e.BillableUnits = 1
 	}
+	if e.InputUnits < 0 {
+		e.InputUnits = 0
+	}
+	if e.OutputUnits < 0 {
+		e.OutputUnits = 0
+	}
+	if e.CachedInputUnits < 0 {
+		e.CachedInputUnits = 0
+	}
+	if e.CachedInputUnits > e.InputUnits {
+		e.CachedInputUnits = e.InputUnits
+	}
+	if e.TotalUnits <= 0 {
+		e.TotalUnits = e.InputUnits + e.OutputUnits
+	}
 	if e.CompletedAt.IsZero() {
 		e.CompletedAt = time.Now()
 	}
@@ -826,18 +901,24 @@ func (e *UsageEvent) applyDefaults() {
 }
 
 type BillableCharge struct {
-	ID              uint      `json:"id" gorm:"primaryKey"`
-	UsageEventID    uint      `json:"usage_event_id" gorm:"uniqueIndex;not null"`
-	AccountID       uint      `json:"account_id" gorm:"not null;index"`
-	APIKeyID        uint      `json:"api_key_id" gorm:"not null;index"`
-	PriceConfigID   *uint     `json:"price_config_id" gorm:"index"`
-	Currency        string    `json:"currency" gorm:"size:16;not null"`
-	UnitPriceMicros int64     `json:"unit_price_micros"`
-	BillableUnits   int64     `json:"billable_units"`
-	AmountMicros    int64     `json:"amount_micros"`
-	UsageClass      string    `json:"usage_class" gorm:"size:64;not null"`
-	CacheState      string    `json:"cache_state" gorm:"size:64;not null"`
-	CreatedAt       time.Time `json:"created_at"`
+	ID                         uint      `json:"id" gorm:"primaryKey"`
+	UsageEventID               uint      `json:"usage_event_id" gorm:"uniqueIndex;not null"`
+	AccountID                  uint      `json:"account_id" gorm:"not null;index"`
+	APIKeyID                   uint      `json:"api_key_id" gorm:"not null;index"`
+	PriceConfigID              *uint     `json:"price_config_id" gorm:"index"`
+	Currency                   string    `json:"currency" gorm:"size:16;not null"`
+	UnitPriceMicros            int64     `json:"unit_price_micros"`
+	InputUnitPriceMicros       int64     `json:"input_unit_price_micros"`
+	OutputUnitPriceMicros      int64     `json:"output_unit_price_micros"`
+	CachedInputUnitPriceMicros int64     `json:"cached_input_unit_price_micros"`
+	BillableUnits              int64     `json:"billable_units"`
+	InputUnits                 int64     `json:"input_units"`
+	CachedInputUnits           int64     `json:"cached_input_units"`
+	OutputUnits                int64     `json:"output_units"`
+	AmountMicros               int64     `json:"amount_micros"`
+	UsageClass                 string    `json:"usage_class" gorm:"size:64;not null"`
+	CacheState                 string    `json:"cache_state" gorm:"size:64;not null"`
+	CreatedAt                  time.Time `json:"created_at"`
 }
 
 func (BillableCharge) TableName() string {
@@ -883,19 +964,25 @@ func (s *Store) CreateBillableChargeForEvent(ctx context.Context, event *UsageEv
 		return nil, err
 	}
 	charge := BillableCharge{
-		UsageEventID:  event.ID,
-		AccountID:     event.AccountID,
-		APIKeyID:      event.APIKeyID,
-		BillableUnits: event.BillableUnits,
-		UsageClass:    event.UsageClass,
-		CacheState:    event.CacheState,
-		Currency:      "USD",
+		UsageEventID:     event.ID,
+		AccountID:        event.AccountID,
+		APIKeyID:         event.APIKeyID,
+		BillableUnits:    event.BillableUnits,
+		InputUnits:       event.InputUnits,
+		CachedInputUnits: event.CachedInputUnits,
+		OutputUnits:      event.OutputUnits,
+		UsageClass:       event.UsageClass,
+		CacheState:       event.CacheState,
+		Currency:         "USD",
 	}
 	if price != nil {
 		charge.PriceConfigID = &price.ID
 		charge.Currency = price.Currency
 		charge.UnitPriceMicros = price.UnitPriceMicros
-		charge.AmountMicros = price.UnitPriceMicros * event.BillableUnits
+		charge.InputUnitPriceMicros = price.InputUnitPriceMicros
+		charge.OutputUnitPriceMicros = price.OutputUnitPriceMicros
+		charge.CachedInputUnitPriceMicros = price.CachedInputUnitPriceMicros
+		charge.AmountMicros = price.AmountMicros(event)
 	}
 	err = s.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&charge).Error
 	if err != nil {
